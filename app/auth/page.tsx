@@ -21,7 +21,7 @@ export default function AuthPage() {
     const email = String(form.get("email") || "");
     const password = String(form.get("password") || "");
 
-    const { error } = await supabase.auth.signInWithPassword({
+    const { data, error } = await supabase.auth.signInWithPassword({
       email,
       password,
     });
@@ -32,7 +32,36 @@ export default function AuthPage() {
       return;
     }
 
-    router.push("/");
+    const user = data.user;
+
+    const { data: profile, error: profileError } = await supabase
+      .from("profiles")
+      .select("role")
+      .eq("id", user.id)
+      .single();
+
+    const role = profile?.role || user.user_metadata?.role;
+
+    const dashboards: Record<string, string> = {
+      reader: "/read",
+      writer: "/write",
+      affiliate: "/earn",
+      advertiser: "/advertise",
+    };
+
+    const destination = dashboards[role];
+
+    if (!destination) {
+      setMessage(
+        profileError
+          ? "We couldn't find your dashboard role. Please contact support."
+          : "Your dashboard role was not found. Please contact support."
+      );
+      setLoading(false);
+      return;
+    }
+
+    router.push(destination);
     router.refresh();
   }
 
@@ -99,4 +128,5 @@ export default function AuthPage() {
     </main>
   );
 }
+
 
