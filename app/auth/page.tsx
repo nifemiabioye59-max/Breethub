@@ -1,17 +1,39 @@
+
 "use client";
 
 import Link from "next/link";
-import { Nav } from "../../components/ui";
 import { FormEvent, useState } from "react";
+import { useRouter } from "next/navigation";
+import { Nav } from "../../components/ui";
+import { supabase } from "../../lib/supabase";
 
 export default function AuthPage() {
+  const router = useRouter();
   const [message, setMessage] = useState("");
+  const [loading, setLoading] = useState(false);
 
-  function handleSubmit(event: FormEvent<HTMLFormElement>) {
+  async function handleSubmit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
-    setMessage(
-      "Demo sign-in submitted. Connect Supabase Auth to enable real authentication."
-    );
+    setLoading(true);
+    setMessage("");
+
+    const form = new FormData(event.currentTarget);
+    const email = String(form.get("email") || "");
+    const password = String(form.get("password") || "");
+
+    const { error } = await supabase.auth.signInWithPassword({
+      email,
+      password,
+    });
+
+    if (error) {
+      setMessage(error.message);
+      setLoading(false);
+      return;
+    }
+
+    router.push("/");
+    router.refresh();
   }
 
   return (
@@ -33,16 +55,30 @@ export default function AuthPage() {
           <form className="form" onSubmit={handleSubmit}>
             <div className="field">
               <label>Email</label>
-              <input type="email" required placeholder="you@example.com" />
+              <input
+                name="email"
+                type="email"
+                required
+                placeholder="you@example.com"
+              />
             </div>
 
             <div className="field">
               <label>Password</label>
-              <input type="password" required placeholder="••••••••" />
+              <input
+                name="password"
+                type="password"
+                required
+                placeholder="Your password"
+              />
             </div>
 
-            <button className="btn btn-primary" type="submit">
-              Sign in
+            <button
+              className="btn btn-primary"
+              type="submit"
+              disabled={loading}
+            >
+              {loading ? "Signing in..." : "Sign in"}
             </button>
           </form>
 
@@ -63,3 +99,4 @@ export default function AuthPage() {
     </main>
   );
 }
+
