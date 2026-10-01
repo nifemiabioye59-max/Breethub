@@ -13477,3 +13477,4469 @@ on public.fx_rates(
 -- ------------------------------------------------------------
 -- END BATCH 19
 -- ============================================================
+-- =========================================================
+-- BREETHUB BATCH 20
+-- CONTENT MARKETPLACE + FULL CONTENT ACCESS
+-- =========================================================
+
+-- ---------------------------------------------------------
+-- CONTENT PURCHASE STATUS
+-- ---------------------------------------------------------
+
+create type public.content_purchase_status as enum (
+  'pending',
+  'payment_pending',
+  'payment_under_review',
+  'approved',
+  'rejected',
+  'refunded',
+  'cancelled'
+);
+
+-- ---------------------------------------------------------
+-- CONTENT LICENSE TYPE
+-- ---------------------------------------------------------
+
+create type public.content_license_type as enum (
+  'personal_reading',
+  'personal_viewing',
+  'personal_listening',
+  'script_license',
+  'article_license',
+  'commercial_license'
+);
+
+-- ---------------------------------------------------------
+-- FULL CONTENT PURCHASES
+--
+-- Used for:
+-- books
+-- scripts
+-- articles
+-- quotes/poetry collections
+-- videos
+-- audiobooks
+--
+-- Chapter purchases remain handled by chapter_purchases.
+-- ---------------------------------------------------------
+
+create table if not exists public.content_purchases (
+  id uuid primary key default gen_random_uuid(),
+
+  buyer_id uuid not null
+    references public.profiles(id)
+    on delete cascade,
+
+  story_id uuid not null
+    references public.stories(id)
+    on delete cascade,
+
+  payment_id uuid
+    references public.payments(id)
+    on delete set null,
+
+  purchase_status public.content_purchase_status
+    not null default 'pending',
+
+  license_type public.content_license_type
+    not null default 'personal_reading',
+
+  amount numeric(18,2) not null check (amount >= 0),
+
+  currency text not null,
+
+  provider_reference text,
+
+  purchased_at timestamptz,
+
+  approved_at timestamptz,
+
+  approved_by uuid
+    references public.profiles(id)
+    on delete set null,
+
+  rejected_at timestamptz,
+
+  rejected_by uuid
+    references public.profiles(id)
+    on delete set null,
+
+  rejection_reason text,
+
+  refunded_at timestamptz,
+
+  metadata jsonb not null default '{}'::jsonb,
+
+  created_at timestamptz not null default now(),
+
+  updated_at timestamptz not null default now(),
+
+  constraint content_purchases_positive_or_free
+    check (amount >= 0)
+);
+
+-- ---------------------------------------------------------
+-- CONTENT ACCESS
+--
+-- Access is granted only after approved payment.
+-- ---------------------------------------------------------
+
+create table if not exists public.content_access (
+  id uuid primary key default gen_random_uuid(),
+
+  user_id uuid not null
+    references public.profiles(id)
+    on delete cascade,
+
+  story_id uuid not null
+    references public.stories(id)
+    on delete cascade,
+
+  purchase_id uuid
+    references public.content_purchases(id)
+    on delete set null,
+
+  access_type text not null default 'purchase'
+    check (
+      access_type in (
+        'purchase',
+        'admin_grant',
+        'reward',
+        'gift'
+      )
+    ),
+
+  license_type public.content_license_type
+    not null default 'personal_reading',
+
+  granted_at timestamptz not null default now(),
+
+  expires_at timestamptz,
+
+  revoked_at timestamptz,
+
+  created_at timestamptz not null default now(),
+
+  unique(user_id, story_id)
+);
+
+-- ---------------------------------------------------------
+-- CONTENT LICENSE TERMS
+-- ---------------------------------------------------------
+
+create table if not exists public.content_license_terms (
+  id uuid primary key default gen_random_uuid(),
+
+  story_id uuid not null
+    references public.stories(id)
+    on delete cascade,
+
+  license_type public.content_license_type not null,
+
+  title text not null,
+
+  description text,
+
+  terms_text text not null,
+
+  commercial_use_allowed boolean not null default false,
+
+  redistribution_allowed boolean not null default false,
+
+  download_allowed boolean not null default false,
+
+  active boolean not null default true,
+
+  created_by uuid
+    references public.profiles(id)
+    on delete set null,
+
+  created_at timestamptz not null default now(),
+
+  updated_at timestamptz not null default now(),
+
+  unique(story_id, license_type)
+);
+
+-- ---------------------------------------------------------
+-- CONTENT PURCHASE HISTORY
+-- ---------------------------------------------------------
+
+create table if not exists public.content_purchase_history (
+  id uuid primary key default gen_random_uuid(),
+
+  purchase_id uuid not null
+    references public.content_purchases(id)
+    on delete cascade,
+
+  old_status public.content_purchase_status,
+
+  new_status public.content_purchase_status not null,
+
+  changed_by uuid
+    references public.profiles(id)
+    on delete set null,
+
+  reason text,
+
+  created_at timestamptz not null default now()
+);
+
+-- ---------------------------------------------------------
+-- USER LICENSE ACCEPTANCE
+-- ---------------------------------------------------------
+
+create table if not exists public.content_license_acceptances (
+  id uuid primary key default gen_random_uuid(),
+
+  user_id uuid not null
+    references public.profiles(id)
+    on delete cascade,
+
+  story_id uuid not null
+    references public.stories(id)
+    on delete cascade,
+
+  license_type public.content_license_type not null,
+
+  terms_id uuid
+    references public.content_license_terms(id)
+    on delete set null,
+
+  accepted_at timestamptz not null default now(),
+
+  ip_address text,
+
+  user_agent text,
+
+  unique(user_id, story_id, license_type)
+);
+
+-- ---------------------------------------------------------
+-- FUNCTION:
+-- CHECK WHETHER A USER HAS APPROVED FULL CONTENT ACCESS
+-- ---------------------------------------------------------
+
+create or replace function public.user_can_access_content(
+  p_user_id uuid,
+  p_story_id uuid
+)
+returns boolean
+language plpgsql
+security definer
+set search_path = public
+as $$
+begin
+
+  if p_user_id is null or p_story_id is null then
+    return false;
+  end if;
+
+  -- Admin always has access.
+  if exists (
+    select 1
+    from public.profiles
+    where id = p_user_id
+      and role = 'admin'::public.app_role
+  ) then
+    return true;
+  end if;
+
+  -- Free published content does not require purchase.
+  if exists (
+    select 1
+    from public.stories
+    where id = p_story_id
+      and status = 'published'::public.content_status
+      and (
+        reading_price is null
+        or reading_price = 0
+      )
+  ) then
+    return true;
+  end if;
+
+  -- Approved content access.
+  return exists (
+    select 1
+    from public.content_access ca
+    where ca.user_id = p_user_id
+      and ca.story_id = p_story_id
+      and ca.revoked_at is null
+      and (
+        ca.expires_at is null
+        or ca.expires_at > now()
+      )
+  );
+
+end;
+$$;
+
+-- ---------------------------------------------------------
+-- FUNCTION:
+-- GRANT FULL CONTENT ACCESS
+--
+-- Client users cannot directly grant themselves access.
+-- ---------------------------------------------------------
+
+create or replace function public.grant_content_access(
+  p_user_id uuid,
+  p_story_id uuid,
+  p_purchase_id uuid,
+  p_license_type public.content_license_type
+)
+returns uuid
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+  v_access_id uuid;
+begin
+
+  if not exists (
+    select 1
+    from public.content_purchases
+    where id = p_purchase_id
+      and buyer_id = p_user_id
+      and story_id = p_story_id
+      and purchase_status = 'approved'
+  ) then
+    raise exception 'Approved purchase required';
+  end if;
+
+  insert into public.content_access (
+    user_id,
+    story_id,
+    purchase_id,
+    access_type,
+    license_type
+  )
+  values (
+    p_user_id,
+    p_story_id,
+    p_purchase_id,
+    'purchase',
+    p_license_type
+  )
+  on conflict (user_id, story_id)
+  do update set
+    purchase_id = excluded.purchase_id,
+    license_type = excluded.license_type,
+    revoked_at = null,
+    expires_at = null;
+
+  select id
+  into v_access_id
+  from public.content_access
+  where user_id = p_user_id
+    and story_id = p_story_id;
+
+  return v_access_id;
+end;
+$$;
+
+-- ---------------------------------------------------------
+-- PURCHASE INSERT SECURITY
+-- ---------------------------------------------------------
+
+alter table public.content_purchases enable row level security;
+
+drop policy if exists "Users create pending content purchases"
+on public.content_purchases;
+
+create policy "Users create pending content purchases"
+on public.content_purchases
+for insert
+to authenticated
+with check (
+  buyer_id = auth.uid()
+  and purchase_status in (
+    'pending',
+    'payment_pending',
+    'payment_under_review'
+  )
+);
+
+drop policy if exists "Users view own content purchases"
+on public.content_purchases;
+
+create policy "Users view own content purchases"
+on public.content_purchases
+for select
+to authenticated
+using (
+  buyer_id = auth.uid()
+  or public.is_admin()
+  or public.has_staff_permission(
+    'view_financials'::public.staff_permission
+  )
+);
+
+-- ---------------------------------------------------------
+-- CONTENT ACCESS SECURITY
+-- ---------------------------------------------------------
+
+alter table public.content_access enable row level security;
+
+drop policy if exists "Users view own content access"
+on public.content_access;
+
+create policy "Users view own content access"
+on public.content_access
+for select
+to authenticated
+using (
+  user_id = auth.uid()
+  or public.is_admin()
+);
+
+-- No normal client INSERT policy.
+-- Access must be granted by trusted server/database function.
+
+-- ---------------------------------------------------------
+-- LICENSE TERMS SECURITY
+-- ---------------------------------------------------------
+
+alter table public.content_license_terms enable row level security;
+
+drop policy if exists "Public view active license terms"
+on public.content_license_terms;
+
+create policy "Public view active license terms"
+on public.content_license_terms
+for select
+to anon, authenticated
+using (
+  active = true
+);
+
+drop policy if exists "Admin manage license terms"
+on public.content_license_terms;
+
+create policy "Admin manage license terms"
+on public.content_license_terms
+for all
+to authenticated
+using (public.is_admin())
+with check (public.is_admin());
+
+-- ---------------------------------------------------------
+-- LICENSE ACCEPTANCES
+-- ---------------------------------------------------------
+
+alter table public.content_license_acceptances enable row level security;
+
+drop policy if exists "Users view own license acceptances"
+on public.content_license_acceptances;
+
+create policy "Users view own license acceptances"
+on public.content_license_acceptances
+for select
+to authenticated
+using (
+  user_id = auth.uid()
+  or public.is_admin()
+);
+
+drop policy if exists "Users create own license acceptances"
+on public.content_license_acceptances;
+
+create policy "Users create own license acceptances"
+on public.content_license_acceptances
+for insert
+to authenticated
+with check (
+  user_id = auth.uid()
+);
+
+-- ---------------------------------------------------------
+-- PURCHASE HISTORY
+-- ---------------------------------------------------------
+
+alter table public.content_purchase_history enable row level security;
+
+drop policy if exists "Users view own purchase history"
+on public.content_purchase_history;
+
+create policy "Users view own purchase history"
+on public.content_purchase_history
+for select
+to authenticated
+using (
+  exists (
+    select 1
+    from public.content_purchases cp
+    where cp.id = content_purchase_history.purchase_id
+      and cp.buyer_id = auth.uid()
+  )
+  or public.is_admin()
+  or public.has_staff_permission(
+    'view_financials'::public.staff_permission
+  )
+);
+
+-- ---------------------------------------------------------
+-- INDEXES
+-- ---------------------------------------------------------
+
+create index if not exists idx_content_purchases_buyer
+on public.content_purchases(buyer_id);
+
+create index if not exists idx_content_purchases_story
+on public.content_purchases(story_id);
+
+create index if not exists idx_content_purchases_status
+on public.content_purchases(purchase_status);
+
+create index if not exists idx_content_access_user
+on public.content_access(user_id);
+
+create index if not exists idx_content_access_story
+on public.content_access(story_id);
+
+create index if not exists idx_content_license_terms_story
+on public.content_license_terms(story_id);
+
+create index if not exists idx_content_license_acceptances_user
+on public.content_license_acceptances(user_id);
+
+-- ---------------------------------------------------------
+-- UPDATED_AT
+-- ---------------------------------------------------------
+
+drop trigger if exists trg_content_purchases_updated_at
+on public.content_purchases;
+
+create trigger trg_content_purchases_updated_at
+before update on public.content_purchases
+for each row
+execute function public.set_updated_at();
+
+drop trigger if exists trg_content_license_terms_updated_at
+on public.content_license_terms;
+
+create trigger trg_content_license_terms_updated_at
+before update on public.content_license_terms
+for each row
+execute function public.set_updated_at();
+
+-- =========================================================
+-- END BATCH 20
+-- =========================================================-- =========================================================
+-- BREETHUB BATCH 21
+-- VERTICAL DISCOVERY FEED
+-- =========================================================
+
+-- ---------------------------------------------------------
+-- FEED MEDIA TYPE
+-- ---------------------------------------------------------
+
+create type public.feed_media_type as enum (
+  'short_story',
+  'video',
+  'audiobook',
+  'poetry',
+  'quote',
+  'article_preview',
+  'script_preview'
+);
+
+-- ---------------------------------------------------------
+-- FEED ITEM STATUS
+-- ---------------------------------------------------------
+
+create type public.feed_item_status as enum (
+  'draft',
+  'pending_review',
+  'approved',
+  'published',
+  'paused',
+  'rejected',
+  'archived'
+);
+
+-- ---------------------------------------------------------
+-- VERTICAL FEED ITEMS
+-- ---------------------------------------------------------
+
+create table if not exists public.feed_items (
+  id uuid primary key default gen_random_uuid(),
+
+  story_id uuid
+    references public.stories(id)
+    on delete cascade,
+
+  chapter_id uuid
+    references public.chapters(id)
+    on delete cascade,
+
+  creator_id uuid not null
+    references public.profiles(id)
+    on delete cascade,
+
+  media_type public.feed_media_type not null,
+
+  title text not null,
+
+  caption text,
+
+  media_url text,
+
+  thumbnail_url text,
+
+  audio_url text,
+
+  duration_seconds integer
+    check (
+      duration_seconds is null
+      or duration_seconds >= 0
+    ),
+
+  display_order integer
+    not null default 0,
+
+  status public.feed_item_status
+    not null default 'draft',
+
+  allow_comments boolean not null default true,
+
+  allow_likes boolean not null default true,
+
+  allow_shares boolean not null default true,
+
+  allow_saves boolean not null default true,
+
+  autoplay boolean not null default true,
+
+  loop_media boolean not null default true,
+
+  view_count bigint not null default 0
+    check (view_count >= 0),
+
+  like_count bigint not null default 0
+    check (like_count >= 0),
+
+  share_count bigint not null default 0
+    check (share_count >= 0),
+
+  save_count bigint not null default 0
+    check (save_count >= 0),
+
+  comment_count bigint not null default 0
+    check (comment_count >= 0),
+
+  published_at timestamptz,
+
+  created_at timestamptz not null default now(),
+
+  updated_at timestamptz not null default now(),
+
+  constraint feed_item_has_content
+  check (
+    story_id is not null
+    or chapter_id is not null
+  )
+);
+
+-- ---------------------------------------------------------
+-- FEED VIEWS
+-- One qualifying view per user/feed item session.
+-- Anonymous viewing can be tracked with a session ID.
+-- ---------------------------------------------------------
+
+create table if not exists public.feed_views (
+  id uuid primary key default gen_random_uuid(),
+
+  feed_item_id uuid not null
+    references public.feed_items(id)
+    on delete cascade,
+
+  user_id uuid
+    references public.profiles(id)
+    on delete set null,
+
+  session_id text,
+
+  watch_seconds integer not null default 0
+    check (watch_seconds >= 0),
+
+  completed boolean not null default false,
+
+  viewed_at timestamptz not null default now()
+);
+
+-- ---------------------------------------------------------
+-- FEED WATCH / READ PROGRESS
+-- ---------------------------------------------------------
+
+create table if not exists public.feed_progress (
+  id uuid primary key default gen_random_uuid(),
+
+  feed_item_id uuid not null
+    references public.feed_items(id)
+    on delete cascade,
+
+  user_id uuid not null
+    references public.profiles(id)
+    on delete cascade,
+
+  progress_seconds integer not null default 0
+    check (progress_seconds >= 0),
+
+  progress_percent numeric(5,2) not null default 0
+    check (
+      progress_percent >= 0
+      and progress_percent <= 100
+    ),
+
+  completed boolean not null default false,
+
+  last_viewed_at timestamptz not null default now(),
+
+  unique(feed_item_id, user_id)
+);
+
+-- ---------------------------------------------------------
+-- FEED LIKES
+-- ---------------------------------------------------------
+
+create table if not exists public.feed_likes (
+  id uuid primary key default gen_random_uuid(),
+
+  feed_item_id uuid not null
+    references public.feed_items(id)
+    on delete cascade,
+
+  user_id uuid not null
+    references public.profiles(id)
+    on delete cascade,
+
+  created_at timestamptz not null default now(),
+
+  unique(feed_item_id, user_id)
+);
+
+-- ---------------------------------------------------------
+-- FEED SAVES
+-- ---------------------------------------------------------
+
+create table if not exists public.feed_saves (
+  id uuid primary key default gen_random_uuid(),
+
+  feed_item_id uuid not null
+    references public.feed_items(id)
+    on delete cascade,
+
+  user_id uuid not null
+    references public.profiles(id)
+    on delete cascade,
+
+  created_at timestamptz not null default now(),
+
+  unique(feed_item_id, user_id)
+);
+
+-- ---------------------------------------------------------
+-- FEED SHARES
+-- ---------------------------------------------------------
+
+create table if not exists public.feed_shares (
+  id uuid primary key default gen_random_uuid(),
+
+  feed_item_id uuid not null
+    references public.feed_items(id)
+    on delete cascade,
+
+  user_id uuid
+    references public.profiles(id)
+    on delete set null,
+
+  share_target text,
+
+  created_at timestamptz not null default now()
+);
+
+-- ---------------------------------------------------------
+-- FEED COMMENTS
+-- ---------------------------------------------------------
+
+create table if not exists public.feed_comments (
+  id uuid primary key default gen_random_uuid(),
+
+  feed_item_id uuid not null
+    references public.feed_items(id)
+    on delete cascade,
+
+  user_id uuid not null
+    references public.profiles(id)
+    on delete cascade,
+
+  parent_comment_id uuid
+    references public.feed_comments(id)
+    on delete cascade,
+
+  body text not null
+    check (length(trim(body)) > 0),
+
+  is_hidden boolean not null default false,
+
+  created_at timestamptz not null default now(),
+
+  updated_at timestamptz not null default now()
+);
+
+-- ---------------------------------------------------------
+-- FEED REPORTS
+-- ---------------------------------------------------------
+
+create table if not exists public.feed_reports (
+  id uuid primary key default gen_random_uuid(),
+
+  feed_item_id uuid not null
+    references public.feed_items(id)
+    on delete cascade,
+
+  reporter_id uuid not null
+    references public.profiles(id)
+    on delete cascade,
+
+  reason text not null,
+
+  details text,
+
+  status text not null default 'pending'
+    check (
+      status in (
+        'pending',
+        'reviewed',
+        'dismissed',
+        'action_taken'
+      )
+    ),
+
+  reviewed_by uuid
+    references public.profiles(id)
+    on delete set null,
+
+  reviewed_at timestamptz,
+
+  created_at timestamptz not null default now()
+);
+
+-- ---------------------------------------------------------
+-- PUBLISHABLE FEED FUNCTION
+-- ---------------------------------------------------------
+
+create or replace function public.can_publish_feed_item(
+  p_feed_item_id uuid
+)
+returns boolean
+language plpgsql
+security definer
+set search_path = public
+as $$
+begin
+
+  return exists (
+    select 1
+    from public.feed_items fi
+    where fi.id = p_feed_item_id
+      and fi.status = 'approved'::public.feed_item_status
+      and (
+        fi.story_id is null
+        or exists (
+          select 1
+          from public.stories s
+          where s.id = fi.story_id
+            and s.status = 'published'::public.content_status
+        )
+      )
+      and (
+        fi.chapter_id is null
+        or exists (
+          select 1
+          from public.chapters c
+          where c.id = fi.chapter_id
+            and c.status = 'published'::public.content_status
+        )
+      )
+  );
+
+end;
+$$;
+
+-- ---------------------------------------------------------
+-- FEED VIEW COUNTER
+-- ---------------------------------------------------------
+
+create or replace function public.record_feed_view(
+  p_feed_item_id uuid,
+  p_user_id uuid default null,
+  p_session_id text default null,
+  p_watch_seconds integer default 0,
+  p_completed boolean default false
+)
+returns uuid
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+  v_view_id uuid;
+begin
+
+  if not exists (
+    select 1
+    from public.feed_items
+    where id = p_feed_item_id
+      and status = 'published'::public.feed_item_status
+  ) then
+    raise exception 'Feed item is not published';
+  end if;
+
+  insert into public.feed_views (
+    feed_item_id,
+    user_id,
+    session_id,
+    watch_seconds,
+    completed
+  )
+  values (
+    p_feed_item_id,
+    p_user_id,
+    p_session_id,
+    greatest(coalesce(p_watch_seconds, 0), 0),
+    coalesce(p_completed, false)
+  )
+  returning id into v_view_id;
+
+  update public.feed_items
+  set view_count = view_count + 1
+  where id = p_feed_item_id;
+
+  return v_view_id;
+end;
+$$;
+
+-- ---------------------------------------------------------
+-- RLS: FEED ITEMS
+-- ---------------------------------------------------------
+
+alter table public.feed_items enable row level security;
+
+drop policy if exists "Public view published feed"
+on public.feed_items;
+
+create policy "Public view published feed"
+on public.feed_items
+for select
+to anon, authenticated
+using (
+  status = 'published'::public.feed_item_status
+);
+
+drop policy if exists "Creators view own feed items"
+on public.feed_items;
+
+create policy "Creators view own feed items"
+on public.feed_items
+for select
+to authenticated
+using (
+  creator_id = auth.uid()
+  or public.is_admin()
+);
+
+drop policy if exists "Creators create own feed items"
+on public.feed_items;
+
+create policy "Creators create own feed items"
+on public.feed_items
+for insert
+to authenticated
+with check (
+  creator_id = auth.uid()
+  and status in (
+    'draft',
+    'pending_review'
+  )
+);
+
+drop policy if exists "Creators update own draft feed items"
+on public.feed_items;
+
+create policy "Creators update own draft feed items"
+on public.feed_items
+for update
+to authenticated
+using (
+  creator_id = auth.uid()
+  and status in (
+    'draft',
+    'pending_review'
+  )
+)
+with check (
+  creator_id = auth.uid()
+  and status in (
+    'draft',
+    'pending_review'
+  )
+);
+
+drop policy if exists "Admin manage feed"
+on public.feed_items;
+
+create policy "Admin manage feed"
+on public.feed_items
+for all
+to authenticated
+using (public.is_admin())
+with check (public.is_admin());
+
+-- ---------------------------------------------------------
+-- RLS: VIEWS
+-- ---------------------------------------------------------
+
+alter table public.feed_views enable row level security;
+
+drop policy if exists "Users view own feed views"
+on public.feed_views;
+
+create policy "Users view own feed views"
+on public.feed_views
+for select
+to authenticated
+using (
+  user_id = auth.uid()
+  or public.is_admin()
+);
+
+-- ---------------------------------------------------------
+-- RLS: PROGRESS
+-- ---------------------------------------------------------
+
+alter table public.feed_progress enable row level security;
+
+drop policy if exists "Users manage own feed progress"
+on public.feed_progress;
+
+create policy "Users manage own feed progress"
+on public.feed_progress
+for all
+to authenticated
+using (
+  user_id = auth.uid()
+)
+with check (
+  user_id = auth.uid()
+);
+
+-- ---------------------------------------------------------
+-- RLS: LIKES
+-- ---------------------------------------------------------
+
+alter table public.feed_likes enable row level security;
+
+drop policy if exists "Users view feed likes"
+on public.feed_likes;
+
+create policy "Users view feed likes"
+on public.feed_likes
+for select
+to authenticated
+using (true);
+
+drop policy if exists "Users manage own feed likes"
+on public.feed_likes;
+
+create policy "Users manage own feed likes"
+on public.feed_likes
+for insert
+to authenticated
+with check (user_id = auth.uid());
+
+drop policy if exists "Users delete own feed likes"
+on public.feed_likes;
+
+create policy "Users delete own feed likes"
+on public.feed_likes
+for delete
+to authenticated
+using (user_id = auth.uid());
+
+-- ---------------------------------------------------------
+-- RLS: SAVES
+-- ---------------------------------------------------------
+
+alter table public.feed_saves enable row level security;
+
+drop policy if exists "Users view own feed saves"
+on public.feed_saves;
+
+create policy "Users view own feed saves"
+on public.feed_saves
+for select
+to authenticated
+using (user_id = auth.uid());
+
+drop policy if exists "Users create own feed saves"
+on public.feed_saves;
+
+create policy "Users create own feed saves"
+on public.feed_saves
+for insert
+to authenticated
+with check (user_id = auth.uid());
+
+drop policy if exists "Users delete own feed saves"
+on public.feed_saves;
+
+create policy "Users delete own feed saves"
+on public.feed_saves
+for delete
+to authenticated
+using (user_id = auth.uid());
+
+-- ---------------------------------------------------------
+-- RLS: SHARES
+-- ---------------------------------------------------------
+
+alter table public.feed_shares enable row level security;
+
+drop policy if exists "Users create feed shares"
+on public.feed_shares;
+
+create policy "Users create feed shares"
+on public.feed_shares
+for insert
+to authenticated
+with check (
+  user_id = auth.uid()
+);
+
+-- ---------------------------------------------------------
+-- RLS: COMMENTS
+-- ---------------------------------------------------------
+
+alter table public.feed_comments enable row level security;
+
+drop policy if exists "Public view visible feed comments"
+on public.feed_comments;
+
+create policy "Public view visible feed comments"
+on public.feed_comments
+for select
+to anon, authenticated
+using (
+  is_hidden = false
+);
+
+drop policy if exists "Users create own feed comments"
+on public.feed_comments;
+
+create policy "Users create own feed comments"
+on public.feed_comments
+for insert
+to authenticated
+with check (
+  user_id = auth.uid()
+);
+
+drop policy if exists "Users update own feed comments"
+on public.feed_comments;
+
+create policy "Users update own feed comments"
+on public.feed_comments
+for update
+to authenticated
+using (
+  user_id = auth.uid()
+)
+with check (
+  user_id = auth.uid()
+);
+
+-- ---------------------------------------------------------
+-- RLS: REPORTS
+-- ---------------------------------------------------------
+
+alter table public.feed_reports enable row level security;
+
+drop policy if exists "Users create own feed reports"
+on public.feed_reports;
+
+create policy "Users create own feed reports"
+on public.feed_reports
+for insert
+to authenticated
+with check (
+  reporter_id = auth.uid()
+);
+
+drop policy if exists "Users view own feed reports"
+on public.feed_reports;
+
+create policy "Users view own feed reports"
+on public.feed_reports
+for select
+to authenticated
+using (
+  reporter_id = auth.uid()
+  or public.is_admin()
+);
+
+drop policy if exists "Admin manage feed reports"
+on public.feed_reports;
+
+create policy "Admin manage feed reports"
+on public.feed_reports
+for update
+to authenticated
+using (public.is_admin())
+with check (public.is_admin());
+
+-- ---------------------------------------------------------
+-- INDEXES
+-- ---------------------------------------------------------
+
+create index if not exists idx_feed_items_status
+on public.feed_items(status);
+
+create index if not exists idx_feed_items_creator
+on public.feed_items(creator_id);
+
+create index if not exists idx_feed_items_story
+on public.feed_items(story_id);
+
+create index if not exists idx_feed_items_chapter
+on public.feed_items(chapter_id);
+
+create index if not exists idx_feed_items_published
+on public.feed_items(published_at desc);
+
+create index if not exists idx_feed_views_feed_item
+on public.feed_views(feed_item_id);
+
+create index if not exists idx_feed_views_user
+on public.feed_views(user_id);
+
+create index if not exists idx_feed_progress_user
+on public.feed_progress(user_id);
+
+create index if not exists idx_feed_likes_feed
+on public.feed_likes(feed_item_id);
+
+create index if not exists idx_feed_saves_user
+on public.feed_saves(user_id);
+
+create index if not exists idx_feed_comments_feed
+on public.feed_comments(feed_item_id);
+
+-- ---------------------------------------------------------
+-- UPDATED_AT
+-- ---------------------------------------------------------
+
+drop trigger if exists trg_feed_items_updated_at
+on public.feed_items;
+
+create trigger trg_feed_items_updated_at
+before update on public.feed_items
+for each row
+execute function public.set_updated_at();
+
+drop trigger if exists trg_feed_comments_updated_at
+on public.feed_comments;
+
+create trigger trg_feed_comments_updated_at
+before update on public.feed_comments
+for each row
+execute function public.set_updated_at();
+
+-- =========================================================
+-- END BATCH 21
+-- =========================================================-- =========================================================
+-- BREETHUB BATCH 22
+-- NARRATION + MUSIC + AUDIO MIXING + APPROVAL
+-- =========================================================
+
+-- ---------------------------------------------------------
+-- NARRATION STATUS
+-- ---------------------------------------------------------
+
+create type public.narration_status as enum (
+  'draft',
+  'uploaded',
+  'pending_review',
+  'approved',
+  'rejected',
+  'published',
+  'archived'
+);
+
+-- ---------------------------------------------------------
+-- MUSIC USAGE STATUS
+-- ---------------------------------------------------------
+
+create type public.music_usage_status as enum (
+  'requested',
+  'approved',
+  'rejected',
+  'revoked'
+);
+
+-- ---------------------------------------------------------
+-- AUDIO MIX STATUS
+-- ---------------------------------------------------------
+
+create type public.audio_mix_status as enum (
+  'draft',
+  'processing',
+  'ready',
+  'pending_review',
+  'approved',
+  'rejected',
+  'published',
+  'archived'
+);
+
+-- ---------------------------------------------------------
+-- NARRATION FILES
+--
+-- Writer can upload or record narration.
+-- ---------------------------------------------------------
+
+create table if not exists public.narration_files (
+  id uuid primary key default gen_random_uuid(),
+
+  creator_id uuid not null
+    references public.profiles(id)
+    on delete cascade,
+
+  story_id uuid
+    references public.stories(id)
+    on delete cascade,
+
+  chapter_id uuid
+    references public.chapters(id)
+    on delete cascade,
+
+  file_url text not null,
+
+  file_name text,
+
+  mime_type text,
+
+  file_size_bytes bigint,
+
+  duration_seconds integer,
+
+  voice_name text,
+
+  language text,
+
+  status public.narration_status
+    not null default 'uploaded',
+
+  transcript text,
+
+  uploaded_at timestamptz not null default now(),
+
+  reviewed_at timestamptz,
+
+  reviewed_by uuid
+    references public.profiles(id)
+    on delete set null,
+
+  rejection_reason text,
+
+  created_at timestamptz not null default now(),
+
+  updated_at timestamptz not null default now(),
+
+  constraint narration_has_target
+  check (
+    story_id is not null
+    or chapter_id is not null
+  )
+);
+
+-- ---------------------------------------------------------
+-- MUSIC USAGE REQUESTS
+--
+-- Uses tracks from the authorized Breethub music library.
+-- ---------------------------------------------------------
+
+create table if not exists public.music_usage_requests (
+  id uuid primary key default gen_random_uuid(),
+
+  music_track_id uuid not null
+    references public.music_tracks(id)
+    on delete cascade,
+
+  creator_id uuid not null
+    references public.profiles(id)
+    on delete cascade,
+
+  story_id uuid
+    references public.stories(id)
+    on delete cascade,
+
+  chapter_id uuid
+    references public.chapters(id)
+    on delete cascade,
+
+  usage_status public.music_usage_status
+    not null default 'requested',
+
+  requested_at timestamptz not null default now(),
+
+  approved_at timestamptz,
+
+  approved_by uuid
+    references public.profiles(id)
+    on delete set null,
+
+  rejected_at timestamptz,
+
+  rejection_reason text,
+
+  revoked_at timestamptz,
+
+  created_at timestamptz not null default now(),
+
+  constraint music_usage_has_target
+  check (
+    story_id is not null
+    or chapter_id is not null
+  )
+);
+
+-- ---------------------------------------------------------
+-- AUDIO MIX PROJECT
+-- ---------------------------------------------------------
+
+create table if not exists public.audio_mix_projects (
+  id uuid primary key default gen_random_uuid(),
+
+  creator_id uuid not null
+    references public.profiles(id)
+    on delete cascade,
+
+  story_id uuid
+    references public.stories(id)
+    on delete cascade,
+
+  chapter_id uuid
+    references public.chapters(id)
+    on delete cascade,
+
+  narration_file_id uuid
+    references public.narration_files(id)
+    on delete set null,
+
+  output_url text,
+
+  output_file_name text,
+
+  duration_seconds integer,
+
+  narration_volume numeric(6,3)
+    not null default 1.000
+    check (
+      narration_volume >= 0
+      and narration_volume <= 2
+    ),
+
+  music_volume numeric(6,3)
+    not null default 0.200
+    check (
+      music_volume >= 0
+      and music_volume <= 2
+    ),
+
+  fade_in_seconds numeric(6,2)
+    not null default 0
+    check (fade_in_seconds >= 0),
+
+  fade_out_seconds numeric(6,2)
+    not null default 0
+    check (fade_out_seconds >= 0),
+
+  status public.audio_mix_status
+    not null default 'draft',
+
+  preview_available boolean not null default false,
+
+  created_at timestamptz not null default now(),
+
+  updated_at timestamptz not null default now(),
+
+  constraint audio_mix_has_target
+  check (
+    story_id is not null
+    or chapter_id is not null
+  )
+);
+
+-- ---------------------------------------------------------
+-- AUDIO MIX TRACKS
+-- ---------------------------------------------------------
+
+create table if not exists public.audio_mix_tracks (
+  id uuid primary key default gen_random_uuid(),
+
+  mix_project_id uuid not null
+    references public.audio_mix_projects(id)
+    on delete cascade,
+
+  music_track_id uuid
+    references public.music_tracks(id)
+    on delete set null,
+
+  narration_file_id uuid
+    references public.narration_files(id)
+    on delete set null,
+
+  start_seconds numeric(10,2)
+    not null default 0
+    check (start_seconds >= 0),
+
+  end_seconds numeric(10,2),
+
+  volume numeric(6,3)
+    not null default 1.000
+    check (
+      volume >= 0
+      and volume <= 2
+    ),
+
+  fade_in_seconds numeric(6,2)
+    not null default 0
+    check (fade_in_seconds >= 0),
+
+  fade_out_seconds numeric(6,2)
+    not null default 0
+    check (fade_out_seconds >= 0),
+
+  created_at timestamptz not null default now(),
+
+  constraint audio_track_has_source
+  check (
+    music_track_id is not null
+    or narration_file_id is not null
+  )
+);
+
+-- ---------------------------------------------------------
+-- AUDIO APPROVALS
+-- ---------------------------------------------------------
+
+create table if not exists public.audio_approvals (
+  id uuid primary key default gen_random_uuid(),
+
+  mix_project_id uuid not null
+    references public.audio_mix_projects(id)
+    on delete cascade,
+
+  decision text not null
+    check (
+      decision in (
+        'approved',
+        'rejected',
+        'changes_requested'
+      )
+    ),
+
+  reviewer_id uuid
+    references public.profiles(id)
+    on delete set null,
+
+  notes text,
+
+  created_at timestamptz not null default now()
+);
+
+-- ---------------------------------------------------------
+-- NARRATION REVIEW FUNCTION
+-- ---------------------------------------------------------
+
+create or replace function public.review_narration(
+  p_narration_id uuid,
+  p_status public.narration_status,
+  p_rejection_reason text default null
+)
+returns boolean
+language plpgsql
+security definer
+set search_path = public
+as $$
+begin
+
+  if not (
+    public.is_admin()
+    or public.has_staff_permission(
+      'manage_content'::public.staff_permission
+    )
+  ) then
+    raise exception 'You do not have permission to review narration';
+  end if;
+
+  if p_status not in (
+    'approved',
+    'rejected'
+  ) then
+    raise exception 'Invalid narration review status';
+  end if;
+
+  update public.narration_files
+  set
+    status = p_status,
+    reviewed_at = now(),
+    reviewed_by = auth.uid(),
+    rejection_reason = p_rejection_reason
+  where id = p_narration_id;
+
+  return found;
+end;
+$$;
+
+-- ---------------------------------------------------------
+-- MUSIC USAGE APPROVAL
+-- ---------------------------------------------------------
+
+create or replace function public.review_music_usage(
+  p_request_id uuid,
+  p_status public.music_usage_status,
+  p_rejection_reason text default null
+)
+returns boolean
+language plpgsql
+security definer
+set search_path = public
+as $$
+begin
+
+  if not (
+    public.is_admin()
+    or public.has_staff_permission(
+      'manage_content'::public.staff_permission
+    )
+  ) then
+    raise exception 'You do not have permission to review music usage';
+  end if;
+
+  if p_status not in (
+    'approved',
+    'rejected'
+  ) then
+    raise exception 'Invalid music usage status';
+  end if;
+
+  update public.music_usage_requests
+  set
+    usage_status = p_status,
+    approved_at = case
+      when p_status = 'approved' then now()
+      else approved_at
+    end,
+    approved_by = case
+      when p_status = 'approved' then auth.uid()
+      else approved_by
+    end,
+    rejected_at = case
+      when p_status = 'rejected' then now()
+      else rejected_at
+    end,
+    rejection_reason = p_rejection_reason
+  where id = p_request_id;
+
+  return found;
+end;
+$$;
+
+-- ---------------------------------------------------------
+-- AUDIO MIX APPROVAL
+-- ---------------------------------------------------------
+
+create or replace function public.review_audio_mix(
+  p_mix_project_id uuid,
+  p_status public.audio_mix_status,
+  p_notes text default null
+)
+returns boolean
+language plpgsql
+security definer
+set search_path = public
+as $$
+begin
+
+  if not (
+    public.is_admin()
+    or public.has_staff_permission(
+      'manage_content'::public.staff_permission
+    )
+  ) then
+    raise exception 'You do not have permission to review audio';
+  end if;
+
+  if p_status not in (
+    'approved',
+    'rejected'
+  ) then
+    raise exception 'Invalid audio review status';
+  end if;
+
+  update public.audio_mix_projects
+  set status = p_status
+  where id = p_mix_project_id;
+
+  insert into public.audio_approvals (
+    mix_project_id,
+    decision,
+    reviewer_id,
+    notes
+  )
+  values (
+    p_mix_project_id,
+    case
+      when p_status = 'approved'
+        then 'approved'
+      else 'rejected'
+    end,
+    auth.uid(),
+    p_notes
+  );
+
+  return found;
+end;
+$$;
+
+-- ---------------------------------------------------------
+-- NARRATION RLS
+-- ---------------------------------------------------------
+
+alter table public.narration_files enable row level security;
+
+drop policy if exists "Creators view own narration"
+on public.narration_files;
+
+create policy "Creators view own narration"
+on public.narration_files
+for select
+to authenticated
+using (
+  creator_id = auth.uid()
+  or public.is_admin()
+);
+
+drop policy if exists "Creators upload narration"
+on public.narration_files;
+
+create policy "Creators upload narration"
+on public.narration_files
+for insert
+to authenticated
+with check (
+  creator_id = auth.uid()
+);
+
+drop policy if exists "Creators update own narration"
+on public.narration_files;
+
+create policy "Creators update own narration"
+on public.narration_files
+for update
+to authenticated
+using (
+  creator_id = auth.uid()
+)
+with check (
+  creator_id = auth.uid()
+);
+
+-- ---------------------------------------------------------
+-- MUSIC USAGE RLS
+-- ---------------------------------------------------------
+
+alter table public.music_usage_requests enable row level security;
+
+drop policy if exists "Creators view own music requests"
+on public.music_usage_requests;
+
+create policy "Creators view own music requests"
+on public.music_usage_requests
+for select
+to authenticated
+using (
+  creator_id = auth.uid()
+  or public.is_admin()
+);
+
+drop policy if exists "Creators request music usage"
+on public.music_usage_requests;
+
+create policy "Creators request music usage"
+on public.music_usage_requests
+for insert
+to authenticated
+with check (
+  creator_id = auth.uid()
+  and usage_status = 'requested'
+);
+
+-- ---------------------------------------------------------
+-- AUDIO MIX RLS
+-- ---------------------------------------------------------
+
+alter table public.audio_mix_projects enable row level security;
+
+drop policy if exists "Creators view own audio mixes"
+on public.audio_mix_projects;
+
+create policy "Creators view own audio mixes"
+on public.audio_mix_projects
+for select
+to authenticated
+using (
+  creator_id = auth.uid()
+  or public.is_admin()
+);
+
+drop policy if exists "Creators create audio mixes"
+on public.audio_mix_projects;
+
+create policy "Creators create audio mixes"
+on public.audio_mix_projects
+for insert
+to authenticated
+with check (
+  creator_id = auth.uid()
+);
+
+drop policy if exists "Creators update own draft audio mixes"
+on public.audio_mix_projects;
+
+create policy "Creators update own draft audio mixes"
+on public.audio_mix_projects
+for update
+to authenticated
+using (
+  creator_id = auth.uid()
+  and status in (
+    'draft',
+    'processing',
+    'ready'
+  )
+)
+with check (
+  creator_id = auth.uid()
+);
+
+-- ---------------------------------------------------------
+-- AUDIO MIX TRACKS RLS
+-- ---------------------------------------------------------
+
+alter table public.audio_mix_tracks enable row level security;
+
+drop policy if exists "Creators manage own audio mix tracks"
+on public.audio_mix_tracks;
+
+create policy "Creators manage own audio mix tracks"
+on public.audio_mix_tracks
+for all
+to authenticated
+using (
+  exists (
+    select 1
+    from public.audio_mix_projects amp
+    where amp.id = audio_mix_tracks.mix_project_id
+      and amp.creator_id = auth.uid()
+  )
+)
+with check (
+  exists (
+    select 1
+    from public.audio_mix_projects amp
+    where amp.id = audio_mix_tracks.mix_project_id
+      and amp.creator_id = auth.uid()
+  )
+);
+
+-- ---------------------------------------------------------
+-- AUDIO APPROVALS
+-- ---------------------------------------------------------
+
+alter table public.audio_approvals enable row level security;
+
+drop policy if exists "Creators view own audio approvals"
+on public.audio_approvals;
+
+create policy "Creators view own audio approvals"
+on public.audio_approvals
+for select
+to authenticated
+using (
+  exists (
+    select 1
+    from public.audio_mix_projects amp
+    where amp.id = audio_approvals.mix_project_id
+      and amp.creator_id = auth.uid()
+  )
+  or public.is_admin()
+);
+
+drop policy if exists "Admin manage audio approvals"
+on public.audio_approvals;
+
+create policy "Admin manage audio approvals"
+on public.audio_approvals
+for all
+to authenticated
+using (
+  public.is_admin()
+)
+with check (
+  public.is_admin()
+);
+
+-- ---------------------------------------------------------
+-- INDEXES
+-- ---------------------------------------------------------
+
+create index if not exists idx_narration_creator
+on public.narration_files(creator_id);
+
+create index if not exists idx_narration_story
+on public.narration_files(story_id);
+
+create index if not exists idx_narration_chapter
+on public.narration_files(chapter_id);
+
+create index if not exists idx_narration_status
+on public.narration_files(status);
+
+create index if not exists idx_music_usage_creator
+on public.music_usage_requests(creator_id);
+
+create index if not exists idx_music_usage_track
+on public.music_usage_requests(music_track_id);
+
+create index if not exists idx_music_usage_status
+on public.music_usage_requests(usage_status);
+
+create index if not exists idx_audio_mix_creator
+on public.audio_mix_projects(creator_id);
+
+create index if not exists idx_audio_mix_story
+on public.audio_mix_projects(story_id);
+
+create index if not exists idx_audio_mix_chapter
+on public.audio_mix_projects(chapter_id);
+
+create index if not exists idx_audio_mix_status
+on public.audio_mix_projects(status);
+
+-- ---------------------------------------------------------
+-- UPDATED_AT
+-- ---------------------------------------------------------
+
+drop trigger if exists trg_narration_updated_at
+on public.narration_files;
+
+create trigger trg_narration_updated_at
+before update on public.narration_files
+for each row
+execute function public.set_updated_at();
+
+drop trigger if exists trg_audio_mix_updated_at
+on public.audio_mix_projects;
+
+create trigger trg_audio_mix_updated_at
+before update on public.audio_mix_projects
+for each row
+execute function public.set_updated_at();
+
+-- =========================================================
+-- END BATCH 22
+-- =========================================================-- =========================================================
+-- BREETHUB BATCH 23
+-- FREE SPIN REWARD ENGINE
+-- =========================================================
+
+-- ---------------------------------------------------------
+-- MAKE SURE FREE-SPIN REWARD TYPES EXIST
+-- ---------------------------------------------------------
+
+alter table public.free_spin_rewards
+  add column if not exists reward_code text;
+
+alter table public.free_spin_rewards
+  add column if not exists reward_title text;
+
+alter table public.free_spin_rewards
+  add column if not exists reward_description text;
+
+alter table public.free_spin_rewards
+  add column if not exists reward_type text;
+
+alter table public.free_spin_rewards
+  add column if not exists reward_value numeric(18,2);
+
+alter table public.free_spin_rewards
+  add column if not exists reward_currency text;
+
+alter table public.free_spin_rewards
+  add column if not exists active boolean not null default true;
+
+alter table public.free_spin_rewards
+  add column if not exists probability_weight numeric(12,4)
+  not null default 1;
+
+-- ---------------------------------------------------------
+-- SPIN RESULT
+-- ---------------------------------------------------------
+
+create table if not exists public.free_spin_results (
+  id uuid primary key default gen_random_uuid(),
+
+  user_id uuid not null
+    references public.profiles(id)
+    on delete cascade,
+
+  spin_history_id uuid
+    references public.free_spin_history(id)
+    on delete set null,
+
+  reward_id uuid
+    references public.free_spin_rewards(id)
+    on delete set null,
+
+  reward_code text,
+
+  reward_title text,
+
+  reward_type text,
+
+  reward_value numeric(18,2),
+
+  reward_currency text,
+
+  created_at timestamptz not null default now()
+);
+
+-- ---------------------------------------------------------
+-- FREE CHAPTER REWARD ACCESS
+-- ---------------------------------------------------------
+
+create table if not exists public.free_spin_chapter_rewards (
+  id uuid primary key default gen_random_uuid(),
+
+  user_id uuid not null
+    references public.profiles(id)
+    on delete cascade,
+
+  spin_result_id uuid
+    references public.free_spin_results(id)
+    on delete cascade,
+
+  chapter_id uuid not null
+    references public.chapters(id)
+    on delete cascade,
+
+  used boolean not null default false,
+
+  used_at timestamptz,
+
+  expires_at timestamptz,
+
+  created_at timestamptz not null default now()
+);
+
+-- ---------------------------------------------------------
+-- REWARD CREDIT LEDGER
+-- ---------------------------------------------------------
+
+create table if not exists public.free_spin_credit_rewards (
+  id uuid primary key default gen_random_uuid(),
+
+  user_id uuid not null
+    references public.profiles(id)
+    on delete cascade,
+
+  spin_result_id uuid
+    references public.free_spin_results(id)
+    on delete cascade,
+
+  amount numeric(18,2) not null
+    check (amount >= 0),
+
+  currency text not null,
+
+  used_amount numeric(18,2) not null default 0
+    check (used_amount >= 0),
+
+  expires_at timestamptz,
+
+  created_at timestamptz not null default now()
+);
+
+-- ---------------------------------------------------------
+-- QUALIFYING PAID CHAPTER COUNT
+--
+-- Only approved/valid chapter purchases count.
+-- Clicks do NOT count.
+-- Cancelled/rejected/refunded purchases do NOT count.
+-- ---------------------------------------------------------
+
+create or replace function public.count_qualifying_paid_chapters(
+  p_user_id uuid
+)
+returns bigint
+language sql
+security definer
+set search_path = public
+as $$
+  select count(distinct cp.chapter_id)
+  from public.chapter_purchases cp
+  where cp.reader_id = p_user_id
+    and cp.status = 'approved'::public.chapter_purchase_status;
+$$;
+
+-- ---------------------------------------------------------
+-- REFRESH READER REWARD ACCOUNT
+--
+-- One spin is earned for every 10 qualifying paid chapters.
+-- ---------------------------------------------------------
+
+create or replace function public.refresh_reader_free_spin_account(
+  p_user_id uuid
+)
+returns public.reader_reward_accounts
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+  v_account public.reader_reward_accounts;
+  v_paid_count bigint;
+  v_total_spins bigint;
+  v_new_spins bigint;
+begin
+
+  if p_user_id is null then
+    raise exception 'User is required';
+  end if;
+
+  v_paid_count :=
+    public.count_qualifying_paid_chapters(p_user_id);
+
+  v_total_spins :=
+    floor(v_paid_count / 10);
+
+  insert into public.reader_reward_accounts (
+    user_id,
+    paid_chapters_count,
+    spins_earned
+  )
+  values (
+    p_user_id,
+    v_paid_count,
+    v_total_spins
+  )
+  on conflict (user_id)
+  do update set
+    paid_chapters_count = excluded.paid_chapters_count,
+    spins_earned = greatest(
+      public.reader_reward_accounts.spins_earned,
+      excluded.spins_earned
+    );
+
+  select *
+  into v_account
+  from public.reader_reward_accounts
+  where user_id = p_user_id;
+
+  return v_account;
+end;
+$$;
+
+-- ---------------------------------------------------------
+-- NUMBER OF UNUSED SPINS
+-- ---------------------------------------------------------
+
+create or replace function public.available_free_spins(
+  p_user_id uuid
+)
+returns bigint
+language sql
+security definer
+set search_path = public
+as $$
+  select greatest(
+    coalesce(rra.spins_earned, 0)
+    - coalesce(rra.spins_used, 0),
+    0
+  )
+  from public.reader_reward_accounts rra
+  where rra.user_id = p_user_id;
+$$;
+
+-- ---------------------------------------------------------
+-- CHECK WHETHER USER CAN SPIN
+-- ---------------------------------------------------------
+
+create or replace function public.can_use_free_spin(
+  p_user_id uuid
+)
+returns boolean
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+  v_available bigint;
+  v_next_spin timestamptz;
+  v_enabled boolean;
+begin
+
+  select enabled
+  into v_enabled
+  from public.free_spin_settings
+  order by created_at desc
+  limit 1;
+
+  if coalesce(v_enabled, false) = false then
+    return false;
+  end if;
+
+  select
+    greatest(
+      coalesce(spins_earned, 0)
+      - coalesce(spins_used, 0),
+      0
+    ),
+    next_spin_available_at
+  into
+    v_available,
+    v_next_spin
+  from public.reader_reward_accounts
+  where user_id = p_user_id;
+
+  if coalesce(v_available, 0) <= 0 then
+    return false;
+  end if;
+
+  if v_next_spin is not null
+     and v_next_spin > now() then
+    return false;
+  end if;
+
+  return true;
+end;
+$$;
+
+-- ---------------------------------------------------------
+-- ATOMIC FREE SPIN
+--
+-- Prevents double-spinning from multiple taps/requests.
+-- ---------------------------------------------------------
+
+create or replace function public.use_free_spin()
+returns jsonb
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+  v_user_id uuid := auth.uid();
+  v_account public.reader_reward_accounts;
+  v_reward public.free_spin_rewards;
+  v_history_id uuid;
+  v_result_id uuid;
+  v_next_spin timestamptz;
+begin
+
+  if v_user_id is null then
+    raise exception 'Authentication required';
+  end if;
+
+  -- Lock the reward account during the spin.
+  select *
+  into v_account
+  from public.reader_reward_accounts
+  where user_id = v_user_id
+  for update;
+
+  if not found then
+    raise exception 'Reward account not found';
+  end if;
+
+  if coalesce(v_account.spins_earned, 0)
+     <= coalesce(v_account.spins_used, 0) then
+    raise exception 'No free spin available';
+  end if;
+
+  if v_account.next_spin_available_at is not null
+     and v_account.next_spin_available_at > now() then
+    raise exception 'Free spin is on cooldown';
+  end if;
+
+  -- Weighted random reward.
+  select *
+  into v_reward
+  from public.free_spin_rewards
+  where active = true
+  order by random() * greatest(
+    coalesce(probability_weight, 1),
+    0.0001
+  )
+  limit 1;
+
+  if not found then
+    raise exception 'No active free-spin rewards configured';
+  end if;
+
+  -- Consume exactly one spin.
+  update public.reader_reward_accounts
+  set
+    spins_used = coalesce(spins_used, 0) + 1,
+    next_spin_available_at =
+      case
+        when v_reward.reward_type in (
+          'another_spin',
+          'try_again'
+        )
+        then now() + interval '3 days'
+        else null
+      end,
+    updated_at = now()
+  where user_id = v_user_id;
+
+  insert into public.free_spin_history (
+    user_id,
+    reward_id,
+    spun_at
+  )
+  values (
+    v_user_id,
+    v_reward.id,
+    now()
+  )
+  returning id into v_history_id;
+
+  insert into public.free_spin_results (
+    user_id,
+    spin_history_id,
+    reward_id,
+    reward_code,
+    reward_title,
+    reward_type,
+    reward_value,
+    reward_currency
+  )
+  values (
+    v_user_id,
+    v_history_id,
+    v_reward.id,
+    v_reward.reward_code,
+    v_reward.reward_title,
+    v_reward.reward_type,
+    v_reward.reward_value,
+    v_reward.reward_currency
+  )
+  returning id into v_result_id;
+
+  return jsonb_build_object(
+    'success', true,
+    'result_id', v_result_id,
+    'reward_id', v_reward.id,
+    'reward_code', v_reward.reward_code,
+    'reward_title', v_reward.reward_title,
+    'reward_type', v_reward.reward_type,
+    'reward_value', v_reward.reward_value,
+    'reward_currency', v_reward.reward_currency
+  );
+end;
+$$;
+
+-- ---------------------------------------------------------
+-- FREE SPIN RLS
+-- ---------------------------------------------------------
+
+alter table public.free_spin_results enable row level security;
+
+drop policy if exists "Users view own spin results"
+on public.free_spin_results;
+
+create policy "Users view own spin results"
+on public.free_spin_results
+for select
+to authenticated
+using (
+  user_id = auth.uid()
+  or public.is_admin()
+);
+
+alter table public.free_spin_chapter_rewards enable row level security;
+
+drop policy if exists "Users view own free chapter rewards"
+on public.free_spin_chapter_rewards;
+
+create policy "Users view own free chapter rewards"
+on public.free_spin_chapter_rewards
+for select
+to authenticated
+using (
+  user_id = auth.uid()
+  or public.is_admin()
+);
+
+alter table public.free_spin_credit_rewards enable row level security;
+
+drop policy if exists "Users view own spin credits"
+on public.free_spin_credit_rewards;
+
+create policy "Users view own spin credits"
+on public.free_spin_credit_rewards
+for select
+to authenticated
+using (
+  user_id = auth.uid()
+  or public.is_admin()
+);
+
+-- ---------------------------------------------------------
+-- INDEXES
+-- ---------------------------------------------------------
+
+create index if not exists idx_free_spin_results_user
+on public.free_spin_results(user_id);
+
+create index if not exists idx_free_spin_results_reward
+on public.free_spin_results(reward_id);
+
+create index if not exists idx_free_spin_chapter_rewards_user
+on public.free_spin_chapter_rewards(user_id);
+
+create index if not exists idx_free_spin_credit_rewards_user
+on public.free_spin_credit_rewards(user_id);
+
+-- =========================================================
+-- END BATCH 23
+-- =========================================================-- =========================================================
+-- BREETHUB BATCH 24
+-- GIFTS + CREATOR REWARDS
+-- =========================================================
+
+-- ---------------------------------------------------------
+-- CREATOR GIFT TRANSACTIONS
+--
+-- This works alongside the existing gifts/gift_types system.
+-- ---------------------------------------------------------
+
+create table if not exists public.creator_gift_transactions (
+  id uuid primary key default gen_random_uuid(),
+
+  sender_id uuid not null
+    references public.profiles(id)
+    on delete cascade,
+
+  recipient_id uuid not null
+    references public.profiles(id)
+    on delete cascade,
+
+  gift_type_id uuid
+    references public.gift_types(id)
+    on delete set null,
+
+  story_id uuid
+    references public.stories(id)
+    on delete set null,
+
+  amount numeric(18,2) not null
+    check (amount >= 0),
+
+  currency text not null,
+
+  payment_id uuid
+    references public.payments(id)
+    on delete set null,
+
+  status text not null default 'pending'
+    check (
+      status in (
+        'pending',
+        'payment_pending',
+        'approved',
+        'rejected',
+        'refunded',
+        'cancelled'
+      )
+    ),
+
+  message text,
+
+  anonymous_to_recipient boolean not null default false,
+
+  created_at timestamptz not null default now(),
+
+  approved_at timestamptz,
+
+  approved_by uuid
+    references public.profiles(id)
+    on delete set null,
+
+  rejection_reason text
+);
+
+-- ---------------------------------------------------------
+-- AFFILIATE REWARD EVENTS
+-- ---------------------------------------------------------
+
+create table if not exists public.affiliate_reward_events (
+  id uuid primary key default gen_random_uuid(),
+
+  affiliate_id uuid not null
+    references public.profiles(id)
+    on delete cascade,
+
+  reward_type text not null,
+
+  reward_title text not null,
+
+  reward_description text,
+
+  amount numeric(18,2),
+
+  currency text,
+
+  source_period public.leaderboard_period,
+
+  source_rank integer,
+
+  status text not null default 'pending'
+    check (
+      status in (
+        'pending',
+        'approved',
+        'paid',
+        'cancelled'
+      )
+    ),
+
+  wallet_transaction_id uuid
+    references public.wallet_transactions(id)
+    on delete set null,
+
+  created_at timestamptz not null default now(),
+
+  approved_at timestamptz,
+
+  paid_at timestamptz
+);
+
+-- ---------------------------------------------------------
+-- WRITER REWARD EVENTS
+-- ---------------------------------------------------------
+
+create table if not exists public.writer_reward_events (
+  id uuid primary key default gen_random_uuid(),
+
+  writer_id uuid not null
+    references public.profiles(id)
+    on delete cascade,
+
+  reward_type text not null,
+
+  reward_title text not null,
+
+  reward_description text,
+
+  amount numeric(18,2),
+
+  currency text,
+
+  source_period public.leaderboard_period,
+
+  source_rank integer,
+
+  story_id uuid
+    references public.stories(id)
+    on delete set null,
+
+  status text not null default 'pending'
+    check (
+      status in (
+        'pending',
+        'approved',
+        'paid',
+        'cancelled'
+      )
+    ),
+
+  wallet_transaction_id uuid
+    references public.wallet_transactions(id)
+    on delete set null,
+
+  created_at timestamptz not null default now(),
+
+  approved_at timestamptz,
+
+  paid_at timestamptz
+);
+
+-- ---------------------------------------------------------
+-- GIFT PAYMENT APPROVAL
+-- ---------------------------------------------------------
+
+create or replace function public.approve_creator_gift(
+  p_gift_id uuid
+)
+returns boolean
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+  v_gift public.creator_gift_transactions;
+begin
+
+  if not (
+    public.is_admin()
+    or public.has_staff_permission(
+      'view_financials'::public.staff_permission
+    )
+  ) then
+    raise exception 'Financial permission required';
+  end if;
+
+  select *
+  into v_gift
+  from public.creator_gift_transactions
+  where id = p_gift_id
+  for update;
+
+  if not found then
+    raise exception 'Gift not found';
+  end if;
+
+  if v_gift.status not in (
+    'pending',
+    'payment_pending'
+  ) then
+    raise exception 'Gift cannot be approved';
+  end if;
+
+  update public.creator_gift_transactions
+  set
+    status = 'approved',
+    approved_at = now(),
+    approved_by = auth.uid()
+  where id = p_gift_id;
+
+  return true;
+end;
+$$;
+
+-- ---------------------------------------------------------
+-- GIFT RLS
+-- ---------------------------------------------------------
+
+alter table public.creator_gift_transactions enable row level security;
+
+drop policy if exists "Users view their gifts"
+on public.creator_gift_transactions;
+
+create policy "Users view their gifts"
+on public.creator_gift_transactions
+for select
+to authenticated
+using (
+  sender_id = auth.uid()
+  or recipient_id = auth.uid()
+  or public.is_admin()
+);
+
+drop policy if exists "Users create pending gifts"
+on public.creator_gift_transactions;
+
+create policy "Users create pending gifts"
+on public.creator_gift_transactions
+for insert
+to authenticated
+with check (
+  sender_id = auth.uid()
+  and sender_id <> recipient_id
+  and status in (
+    'pending',
+    'payment_pending'
+  )
+);
+
+-- ---------------------------------------------------------
+-- AFFILIATE REWARD RLS
+-- ---------------------------------------------------------
+
+alter table public.affiliate_reward_events enable row level security;
+
+drop policy if exists "Affiliate views own rewards"
+on public.affiliate_reward_events;
+
+create policy "Affiliate views own rewards"
+on public.affiliate_reward_events
+for select
+to authenticated
+using (
+  affiliate_id = auth.uid()
+  or public.is_admin()
+  or public.has_staff_permission(
+    'view_financials'::public.staff_permission
+  )
+);
+
+drop policy if exists "Admin manages affiliate rewards"
+on public.affiliate_reward_events;
+
+create policy "Admin manages affiliate rewards"
+on public.affiliate_reward_events
+for all
+to authenticated
+using (public.is_admin())
+with check (public.is_admin());
+
+-- ---------------------------------------------------------
+-- WRITER REWARD RLS
+-- ---------------------------------------------------------
+
+alter table public.writer_reward_events enable row level security;
+
+drop policy if exists "Writer views own rewards"
+on public.writer_reward_events;
+
+create policy "Writer views own rewards"
+on public.writer_reward_events
+for select
+to authenticated
+using (
+  writer_id = auth.uid()
+  or public.is_admin()
+  or public.has_staff_permission(
+    'view_financials'::public.staff_permission
+  )
+);
+
+drop policy if exists "Admin manages writer rewards"
+on public.writer_reward_events;
+
+create policy "Admin manages writer rewards"
+on public.writer_reward_events
+for all
+to authenticated
+using (public.is_admin())
+with check (public.is_admin());
+
+-- ---------------------------------------------------------
+-- GIFT INDEXES
+-- ---------------------------------------------------------
+
+create index if not exists idx_creator_gifts_sender
+on public.creator_gift_transactions(sender_id);
+
+create index if not exists idx_creator_gifts_recipient
+on public.creator_gift_transactions(recipient_id);
+
+create index if not exists idx_creator_gifts_status
+on public.creator_gift_transactions(status);
+
+create index if not exists idx_creator_gifts_story
+on public.creator_gift_transactions(story_id);
+
+create index if not exists idx_affiliate_rewards_affiliate
+on public.affiliate_reward_events(affiliate_id);
+
+create index if not exists idx_writer_rewards_writer
+on public.writer_reward_events(writer_id);
+
+-- =========================================================
+-- END BATCH 24
+-- =========================================================-- =========================================================
+-- BREETHUB BATCH 25
+-- NOTIFICATION AUTOMATION + STAFF CHAT CENTER
+-- =========================================================
+
+-- ---------------------------------------------------------
+-- CONVERSATION ASSIGNMENT HISTORY
+-- ---------------------------------------------------------
+
+create table if not exists public.conversation_assignment_history (
+  id uuid primary key default gen_random_uuid(),
+
+  conversation_id uuid not null
+    references public.conversations(id)
+    on delete cascade,
+
+  previous_staff_id uuid
+    references public.profiles(id)
+    on delete set null,
+
+  new_staff_id uuid
+    references public.profiles(id)
+    on delete set null,
+
+  assigned_by uuid
+    references public.profiles(id)
+    on delete set null,
+
+  reason text,
+
+  created_at timestamptz not null default now()
+);
+
+-- ---------------------------------------------------------
+-- CHAT STAFF ACTIONS
+--
+-- Keeps an audit trail of official support actions.
+-- ---------------------------------------------------------
+
+create table if not exists public.chat_staff_actions (
+  id uuid primary key default gen_random_uuid(),
+
+  conversation_id uuid not null
+    references public.conversations(id)
+    on delete cascade,
+
+  staff_id uuid not null
+    references public.profiles(id)
+    on delete cascade,
+
+  action_type text not null
+    check (
+      action_type in (
+        'assigned',
+        'reassigned',
+        'replied',
+        'resolved',
+        'reopened',
+        'escalated',
+        'archived'
+      )
+    ),
+
+  notes text,
+
+  created_at timestamptz not null default now()
+);
+
+-- ---------------------------------------------------------
+-- CHAT NOTIFICATION PREFERENCES
+-- ---------------------------------------------------------
+
+alter table public.notification_preferences
+  add column if not exists chat_messages_enabled boolean
+  not null default true;
+
+alter table public.notification_preferences
+  add column if not exists payment_updates_enabled boolean
+  not null default true;
+
+alter table public.notification_preferences
+  add column if not exists course_updates_enabled boolean
+  not null default true;
+
+alter table public.notification_preferences
+  add column if not exists content_updates_enabled boolean
+  not null default true;
+
+alter table public.notification_preferences
+  add column if not exists reward_updates_enabled boolean
+  not null default true;
+
+-- ---------------------------------------------------------
+-- OFFICIAL STAFF IDENTITY LOOKUP
+--
+-- This lets the UI show:
+--
+-- Breethub Admin
+-- Breethub Support — Secretary
+-- Breethub Support
+--
+-- instead of pretending a Secretary is the Admin.
+-- ---------------------------------------------------------
+
+create or replace function public.get_staff_chat_identity(
+  p_user_id uuid
+)
+returns table (
+  user_id uuid,
+  display_name text,
+  staff_role public.app_role,
+  is_official boolean
+)
+language sql
+security definer
+set search_path = public
+as $$
+  select
+    p.user_id,
+    coalesce(
+      s.display_name,
+      case
+        when p.role = 'admin'::public.app_role
+          then 'Breethub Admin'
+        when p.role = 'secretary'::public.app_role
+          then 'Breethub Support — Secretary'
+        when p.role = 'customer_care'::public.app_role
+          then 'Breethub Support'
+        else 'Breethub Support'
+      end
+    ) as display_name,
+    p.role,
+    true
+  from public.profiles p
+  left join public.staff_display_identity s
+    on s.user_id = p.user_id
+  where p.user_id = p_user_id
+    and p.role in (
+      'admin'::public.app_role,
+      'management'::public.app_role,
+      'secretary'::public.app_role,
+      'customer_care'::public.app_role
+    );
+$$;
+
+-- ---------------------------------------------------------
+-- ASSIGN CONVERSATION TO STAFF
+-- ---------------------------------------------------------
+
+create or replace function public.assign_conversation_to_staff(
+  p_conversation_id uuid,
+  p_staff_id uuid,
+  p_reason text default null
+)
+returns uuid
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+  v_old_staff uuid;
+  v_assignment_id uuid;
+begin
+
+  if not (
+    public.is_admin()
+    or public.has_staff_permission(
+      'manage_messages'::public.staff_permission
+    )
+  ) then
+    raise exception 'You do not have permission to assign conversations';
+  end if;
+
+  if not exists (
+    select 1
+    from public.profiles
+    where id = p_staff_id
+      and role in (
+        'admin'::public.app_role,
+        'management'::public.app_role,
+        'secretary'::public.app_role,
+        'customer_care'::public.app_role
+      )
+  ) then
+    raise exception 'Selected user is not authorized support staff';
+  end if;
+
+  select assigned_staff_id
+  into v_old_staff
+  from public.conversations
+  where id = p_conversation_id
+  for update;
+
+  if not found then
+    raise exception 'Conversation not found';
+  end if;
+
+  update public.conversations
+  set
+    assigned_staff_id = p_staff_id,
+    updated_at = now()
+  where id = p_conversation_id;
+
+  insert into public.conversation_assignment_history (
+    conversation_id,
+    previous_staff_id,
+    new_staff_id,
+    assigned_by,
+    reason
+  )
+  values (
+    p_conversation_id,
+    v_old_staff,
+    p_staff_id,
+    auth.uid(),
+    p_reason
+  )
+  returning id into v_assignment_id;
+
+  insert into public.chat_staff_actions (
+    conversation_id,
+    staff_id,
+    action_type,
+    notes
+  )
+  values (
+    p_conversation_id,
+    auth.uid(),
+    case
+      when v_old_staff is null
+        then 'assigned'
+      else 'reassigned'
+    end,
+    p_reason
+  );
+
+  return v_assignment_id;
+end;
+$$;
+
+-- ---------------------------------------------------------
+-- RESOLVE CONVERSATION
+-- ---------------------------------------------------------
+
+create or replace function public.resolve_conversation(
+  p_conversation_id uuid,
+  p_note text default null
+)
+returns boolean
+language plpgsql
+security definer
+set search_path = public
+as $$
+begin
+
+  if not (
+    public.is_admin()
+    or public.has_staff_permission(
+      'manage_messages'::public.staff_permission
+    )
+  ) then
+    raise exception 'You do not have permission to resolve conversations';
+  end if;
+
+  update public.conversations
+  set
+    status = 'resolved'::public.conversation_status,
+    updated_at = now()
+  where id = p_conversation_id;
+
+  if not found then
+    raise exception 'Conversation not found';
+  end if;
+
+  insert into public.chat_staff_actions (
+    conversation_id,
+    staff_id,
+    action_type,
+    notes
+  )
+  values (
+    p_conversation_id,
+    auth.uid(),
+    'resolved',
+    p_note
+  );
+
+  return true;
+end;
+$$;
+
+-- ---------------------------------------------------------
+-- REOPEN CONVERSATION
+-- ---------------------------------------------------------
+
+create or replace function public.reopen_conversation(
+  p_conversation_id uuid
+)
+returns boolean
+language plpgsql
+security definer
+set search_path = public
+as $$
+begin
+
+  if not (
+    public.is_admin()
+    or public.has_staff_permission(
+      'manage_messages'::public.staff_permission
+    )
+  ) then
+    raise exception 'You do not have permission to reopen conversations';
+  end if;
+
+  update public.conversations
+  set
+    status = 'open'::public.conversation_status,
+    updated_at = now()
+  where id = p_conversation_id;
+
+  if not found then
+    raise exception 'Conversation not found';
+  end if;
+
+  insert into public.chat_staff_actions (
+    conversation_id,
+    staff_id,
+    action_type
+  )
+  values (
+    p_conversation_id,
+    auth.uid(),
+    'reopened'
+  );
+
+  return true;
+end;
+$$;
+
+-- ---------------------------------------------------------
+-- ESCALATE CONVERSATION TO ADMIN
+-- ---------------------------------------------------------
+
+create or replace function public.escalate_conversation(
+  p_conversation_id uuid,
+  p_reason text default null
+)
+returns boolean
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+  v_admin_id uuid;
+begin
+
+  if not (
+    public.is_admin()
+    or public.has_staff_permission(
+      'manage_messages'::public.staff_permission
+    )
+  ) then
+    raise exception 'You do not have permission to escalate conversations';
+  end if;
+
+  select id
+  into v_admin_id
+  from public.profiles
+  where role = 'admin'::public.app_role
+  limit 1;
+
+  if v_admin_id is null then
+    raise exception 'No Admin account is configured';
+  end if;
+
+  update public.conversations
+  set
+    assigned_staff_id = v_admin_id,
+    updated_at = now()
+  where id = p_conversation_id;
+
+  insert into public.chat_staff_actions (
+    conversation_id,
+    staff_id,
+    action_type,
+    notes
+  )
+  values (
+    p_conversation_id,
+    auth.uid(),
+    'escalated',
+    p_reason
+  );
+
+  return true;
+end;
+$$;
+
+-- ---------------------------------------------------------
+-- CHAT ASSIGNMENT RLS
+-- ---------------------------------------------------------
+
+alter table public.conversation_assignment_history enable row level security;
+
+drop policy if exists "Staff view conversation assignment history"
+on public.conversation_assignment_history;
+
+create policy "Staff view conversation assignment history"
+on public.conversation_assignment_history
+for select
+to authenticated
+using (
+  public.is_admin()
+  or public.has_staff_permission(
+    'manage_messages'::public.staff_permission
+  )
+);
+
+alter table public.chat_staff_actions enable row level security;
+
+drop policy if exists "Staff view chat actions"
+on public.chat_staff_actions;
+
+create policy "Staff view chat actions"
+on public.chat_staff_actions
+for select
+to authenticated
+using (
+  public.is_admin()
+  or public.has_staff_permission(
+    'manage_messages'::public.staff_permission
+  )
+);
+
+-- ---------------------------------------------------------
+-- NOTIFICATION HELPERS
+-- ---------------------------------------------------------
+
+create or replace function public.notify_user(
+  p_user_id uuid,
+  p_type public.notification_type,
+  p_title text,
+  p_message text,
+  p_link text default null
+)
+returns uuid
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+  v_notification_id uuid;
+begin
+
+  insert into public.notifications (
+    user_id,
+    type,
+    title,
+    message,
+    link
+  )
+  values (
+    p_user_id,
+    p_type,
+    p_title,
+    p_message,
+    p_link
+  )
+  returning id into v_notification_id;
+
+  return v_notification_id;
+end;
+$$;
+
+-- ---------------------------------------------------------
+-- CHAT MESSAGE NOTIFICATION
+-- ---------------------------------------------------------
+
+create or replace function public.notify_conversation_participants(
+  p_conversation_id uuid,
+  p_sender_id uuid,
+  p_message_preview text
+)
+returns integer
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+  v_count integer := 0;
+  v_participant uuid;
+begin
+
+  for v_participant in
+    select cp.user_id
+    from public.conversation_participants cp
+    where cp.conversation_id = p_conversation_id
+      and cp.user_id <> p_sender_id
+  loop
+
+    perform public.notify_user(
+      v_participant,
+      'message'::public.notification_type,
+      'New message',
+      left(coalesce(p_message_preview, 'You have a new message.'), 160),
+      '/messages'
+    );
+
+    v_count := v_count + 1;
+  end loop;
+
+  return v_count;
+end;
+$$;
+
+-- ---------------------------------------------------------
+-- INDEXES
+-- ---------------------------------------------------------
+
+create index if not exists idx_conversation_assignment_history_conversation
+on public.conversation_assignment_history(conversation_id);
+
+create index if not exists idx_conversation_assignment_history_staff
+on public.conversation_assignment_history(new_staff_id);
+
+create index if not exists idx_chat_staff_actions_conversation
+on public.chat_staff_actions(conversation_id);
+
+create index if not exists idx_chat_staff_actions_staff
+on public.chat_staff_actions(staff_id);
+
+-- =========================================================
+-- END BATCH 25
+-- =========================================================-- =========================================================
+-- BREETHUB BATCH 26
+-- ADMIN REPORTING + REAL DATABASE ANALYTICS
+-- =========================================================
+
+create table if not exists public.admin_report_exports (
+  id uuid primary key default gen_random_uuid(),
+
+  requested_by uuid not null
+    references public.profiles(id)
+    on delete cascade,
+
+  report_type text not null,
+
+  date_from timestamptz,
+
+  date_to timestamptz,
+
+  filters jsonb not null default '{}'::jsonb,
+
+  status text not null default 'requested'
+    check (
+      status in (
+        'requested',
+        'processing',
+        'ready',
+        'failed'
+      )
+    ),
+
+  file_url text,
+
+  created_at timestamptz not null default now(),
+
+  completed_at timestamptz,
+
+  error_message text
+);
+
+-- ---------------------------------------------------------
+-- REAL PLATFORM SUMMARY
+-- ---------------------------------------------------------
+
+create or replace view public.admin_platform_summary
+with (security_invoker = true)
+as
+select
+  (select count(*) from public.profiles) as total_users,
+
+  (
+    select count(*)
+    from public.profiles
+    where role = 'writer'::public.app_role
+  ) as total_writers,
+
+  (
+    select count(*)
+    from public.profiles
+    where role = 'affiliate'::public.app_role
+  ) as total_affiliates,
+
+  (
+    select count(*)
+    from public.profiles
+    where role = 'advertiser'::public.app_role
+  ) as total_advertisers,
+
+  (
+    select count(*)
+    from public.profiles
+    where role = 'reader'::public.app_role
+  ) as total_readers,
+
+  (
+    select count(*)
+    from public.stories
+    where status = 'published'::public.content_status
+  ) as published_stories,
+
+  (
+    select count(*)
+    from public.chapters
+    where status = 'published'::public.content_status
+  ) as published_chapters,
+
+  (
+    select count(*)
+    from public.courses
+    where status = 'active'::public.course_status
+  ) as active_courses,
+
+  (
+    select count(*)
+    from public.payments
+    where status = 'pending'
+  ) as pending_payments;
+
+-- ---------------------------------------------------------
+-- REAL PAYMENT SUMMARY
+-- ---------------------------------------------------------
+
+create or replace view public.admin_payment_summary
+with (security_invoker = true)
+as
+select
+  currency,
+  status,
+  count(*) as transaction_count,
+  coalesce(sum(amount), 0) as total_amount
+from public.payments
+group by currency, status;
+
+-- ---------------------------------------------------------
+-- REAL CONTENT SUMMARY
+-- ---------------------------------------------------------
+
+create or replace view public.admin_content_summary
+with (security_invoker = true)
+as
+select
+  content_type,
+  status,
+  count(*) as content_count
+from public.stories
+group by content_type, status;
+
+-- ---------------------------------------------------------
+-- REAL DAILY USER REGISTRATION DATA
+-- ---------------------------------------------------------
+
+create or replace view public.admin_daily_user_registrations
+with (security_invoker = true)
+as
+select
+  date_trunc('day', created_at) as registration_day,
+  count(*) as registrations
+from public.profiles
+group by date_trunc('day', created_at)
+order by registration_day desc;
+
+-- ---------------------------------------------------------
+-- ADMIN REPORT EXPORT RLS
+-- ---------------------------------------------------------
+
+alter table public.admin_report_exports enable row level security;
+
+drop policy if exists "Admins manage report exports"
+on public.admin_report_exports;
+
+create policy "Admins manage report exports"
+on public.admin_report_exports
+for all
+to authenticated
+using (public.is_admin())
+with check (public.is_admin());
+
+-- ---------------------------------------------------------
+-- INDEX
+-- ---------------------------------------------------------
+
+create index if not exists idx_admin_report_exports_requested_by
+on public.admin_report_exports(requested_by);
+
+create index if not exists idx_admin_report_exports_status
+on public.admin_report_exports(status);
+
+-- =========================================================
+-- END BATCH 26
+-- =========================================================-- =========================================================
+-- BREETHUB BATCH 27
+-- SEARCH + DISCOVERY
+-- =========================================================
+
+-- ---------------------------------------------------------
+-- STORY SEARCH VECTOR
+-- ---------------------------------------------------------
+
+alter table public.stories
+add column if not exists search_vector tsvector;
+
+-- ---------------------------------------------------------
+-- PROFILE SEARCH VECTOR
+-- ---------------------------------------------------------
+
+alter table public.profiles
+add column if not exists search_vector tsvector;
+
+-- ---------------------------------------------------------
+-- UPDATE STORY SEARCH VECTOR
+-- ---------------------------------------------------------
+
+create or replace function public.update_story_search_vector()
+returns trigger
+language plpgsql
+as $$
+begin
+
+  new.search_vector :=
+    to_tsvector(
+      'simple',
+      concat_ws(
+        ' ',
+        coalesce(new.title, ''),
+        coalesce(new.description, ''),
+        coalesce(new.genre, ''),
+        coalesce(new.language, ''),
+        coalesce(new.content_type::text, '')
+      )
+    );
+
+  return new;
+end;
+$$;
+
+drop trigger if exists trg_story_search_vector
+on public.stories;
+
+create trigger trg_story_search_vector
+before insert or update of
+  title,
+  description,
+  genre,
+  language,
+  content_type
+on public.stories
+for each row
+execute function public.update_story_search_vector();
+
+-- ---------------------------------------------------------
+-- UPDATE PROFILE SEARCH VECTOR
+-- ---------------------------------------------------------
+
+create or replace function public.update_profile_search_vector()
+returns trigger
+language plpgsql
+as $$
+begin
+
+  new.search_vector :=
+    to_tsvector(
+      'simple',
+      concat_ws(
+        ' ',
+        coalesce(new.full_name, ''),
+        coalesce(new.nickname, ''),
+        coalesce(new.bio, '')
+      )
+    );
+
+  return new;
+end;
+$$;
+
+drop trigger if exists trg_profile_search_vector
+on public.profiles;
+
+create trigger trg_profile_search_vector
+before insert or update of
+  full_name,
+  nickname,
+  bio
+on public.profiles
+for each row
+execute function public.update_profile_search_vector();
+
+-- ---------------------------------------------------------
+-- SEARCH INDEXES
+-- ---------------------------------------------------------
+
+create index if not exists idx_stories_search_vector
+on public.stories
+using gin(search_vector);
+
+create index if not exists idx_profiles_search_vector
+on public.profiles
+using gin(search_vector);
+
+create index if not exists idx_stories_genre
+on public.stories(genre);
+
+create index if not exists idx_stories_content_type
+on public.stories(content_type);
+
+create index if not exists idx_stories_language
+on public.stories(language);
+
+create index if not exists idx_stories_status
+on public.stories(status);
+
+-- ---------------------------------------------------------
+-- STORY SEARCH FUNCTION
+-- ---------------------------------------------------------
+
+create or replace function public.search_stories(
+  p_query text default null,
+  p_genre text default null,
+  p_content_type public.content_type default null,
+  p_language text default null,
+  p_limit integer default 30,
+  p_offset integer default 0
+)
+returns setof public.stories
+language sql
+stable
+security invoker
+as $$
+  select s.*
+  from public.stories s
+  where s.status = 'published'::public.content_status
+
+    and (
+      nullif(trim(p_query), '') is null
+      or s.search_vector @@
+        websearch_to_tsquery(
+          'simple',
+          trim(p_query)
+        )
+    )
+
+    and (
+      p_genre is null
+      or lower(s.genre) = lower(p_genre)
+    )
+
+    and (
+      p_content_type is null
+      or s.content_type = p_content_type
+    )
+
+    and (
+      p_language is null
+      or lower(s.language) = lower(p_language)
+    )
+
+  order by
+    case
+      when nullif(trim(p_query), '') is not null
+      then ts_rank(
+        s.search_vector,
+        websearch_to_tsquery(
+          'simple',
+          trim(p_query)
+        )
+      )
+      else 0
+    end desc,
+
+    s.is_featured desc,
+    s.published_at desc nulls last
+
+  limit greatest(least(p_limit, 100), 1)
+  offset greatest(p_offset, 0);
+$$;
+
+-- ---------------------------------------------------------
+-- CREATOR SEARCH FUNCTION
+-- ---------------------------------------------------------
+
+create or replace function public.search_creators(
+  p_query text,
+  p_limit integer default 30
+)
+returns setof public.profiles
+language sql
+stable
+security invoker
+as $$
+  select p.*
+  from public.profiles p
+  where p.account_status = 'active'::public.account_status
+    and p.search_vector @@
+      websearch_to_tsquery(
+        'simple',
+        trim(p_query)
+      )
+  order by
+    ts_rank(
+      p.search_vector,
+      websearch_to_tsquery(
+        'simple',
+        trim(p_query)
+      )
+    ) desc
+  limit greatest(least(p_limit, 100), 1);
+$$;
+
+-- =========================================================
+-- END BATCH 27
+-- =========================================================-- =========================================================
+-- BREETHUB BATCH 28
+-- SECURITY HARDENING
+-- =========================================================
+
+-- ---------------------------------------------------------
+-- PROFILE PRIVILEGE PROTECTION
+--
+-- Users may update their profile information, but must not
+-- promote themselves to Admin/Staff or verify themselves.
+-- ---------------------------------------------------------
+
+create or replace function public.prevent_profile_privilege_escalation()
+returns trigger
+language plpgsql
+security definer
+set search_path = public
+as $$
+begin
+
+  if auth.uid() is not null
+     and auth.uid() = old.id
+     and not public.is_admin()
+  then
+
+    new.role := old.role;
+
+    new.account_status := old.account_status;
+
+    new.is_verified := old.is_verified;
+
+  end if;
+
+  return new;
+end;
+$$;
+
+drop trigger if exists trg_prevent_profile_privilege_escalation
+on public.profiles;
+
+create trigger trg_prevent_profile_privilege_escalation
+before update on public.profiles
+for each row
+execute function public.prevent_profile_privilege_escalation();
+
+-- ---------------------------------------------------------
+-- PAYMENT PROTECTION
+--
+-- Normal users can create payment intents, but cannot make
+-- their own payment approved/verified.
+-- ---------------------------------------------------------
+
+create or replace function public.prevent_payment_self_approval()
+returns trigger
+language plpgsql
+security definer
+set search_path = public
+as $$
+begin
+
+  if auth.uid() is not null
+     and not public.is_admin()
+     and not public.has_staff_permission(
+       'view_financials'::public.staff_permission
+     )
+  then
+
+    if tg_op = 'UPDATE' then
+
+      new.status := old.status;
+      new.verified_at := old.verified_at;
+      new.verified_by := old.verified_by;
+      new.rejection_reason := old.rejection_reason;
+
+    end if;
+
+  end if;
+
+  return new;
+end;
+$$;
+
+drop trigger if exists trg_prevent_payment_self_approval
+on public.payments;
+
+create trigger trg_prevent_payment_self_approval
+before update on public.payments
+for each row
+execute function public.prevent_payment_self_approval();
+
+-- ---------------------------------------------------------
+-- CHAPTER PURCHASE PROTECTION
+-- ---------------------------------------------------------
+
+create or replace function public.prevent_chapter_purchase_status_tampering()
+returns trigger
+language plpgsql
+security definer
+set search_path = public
+as $$
+begin
+
+  if auth.uid() is not null
+     and not public.is_admin()
+     and not public.has_staff_permission(
+       'view_financials'::public.staff_permission
+     )
+  then
+
+    new.status := old.status;
+
+    new.approved_at := old.approved_at;
+
+    new.approved_by := old.approved_by;
+
+    new.rejection_reason := old.rejection_reason;
+
+  end if;
+
+  return new;
+end;
+$$;
+
+drop trigger if exists trg_protect_chapter_purchase_status
+on public.chapter_purchases;
+
+create trigger trg_protect_chapter_purchase_status
+before update on public.chapter_purchases
+for each row
+execute function public.prevent_chapter_purchase_status_tampering();
+
+-- ---------------------------------------------------------
+-- INVESTMENT PROTECTION
+-- ---------------------------------------------------------
+
+create or replace function public.prevent_investment_client_status_changes()
+returns trigger
+language plpgsql
+security definer
+set search_path = public
+as $$
+begin
+
+  if auth.uid() is not null
+     and not public.is_admin()
+  then
+
+    new.status := old.status;
+
+    new.approved_at := old.approved_at;
+
+    new.approved_by := old.approved_by;
+
+  end if;
+
+  return new;
+end;
+$$;
+
+drop trigger if exists trg_protect_investment_status
+on public.investments;
+
+create trigger trg_protect_investment_status
+before update on public.investments
+for each row
+execute function public.prevent_investment_client_status_changes();
+
+-- ---------------------------------------------------------
+-- ADVERTISER CAMPAIGN PROTECTION
+--
+-- Advertisers cannot mark their own campaign Active,
+-- verified, approved or reviewed.
+-- ---------------------------------------------------------
+
+create or replace function public.prevent_advertiser_campaign_self_approval()
+returns trigger
+language plpgsql
+security definer
+set search_path = public
+as $$
+begin
+
+  if auth.uid() is not null
+     and not public.is_admin()
+  then
+
+    new.status := old.status;
+
+    new.payment_verified_at := old.payment_verified_at;
+
+    new.payment_verified_by := old.payment_verified_by;
+
+    new.reviewed_at := old.reviewed_at;
+
+    new.reviewed_by := old.reviewed_by;
+
+    new.rejection_reason := old.rejection_reason;
+
+  end if;
+
+  return new;
+end;
+$$;
+
+drop trigger if exists trg_prevent_ad_campaign_self_approval
+on public.advertising_campaigns;
+
+create trigger trg_prevent_ad_campaign_self_approval
+before update on public.advertising_campaigns
+for each row
+execute function public.prevent_advertiser_campaign_self_approval();
+
+-- ---------------------------------------------------------
+-- CONTENT ACCESS PROTECTION
+--
+-- No ordinary authenticated INSERT policy is added here.
+-- Access must come from trusted functions/payment approval.
+-- ---------------------------------------------------------
+
+revoke insert, update, delete
+on public.content_access
+from authenticated;
+
+revoke insert, update, delete
+on public.chapter_access
+from authenticated;
+
+-- ---------------------------------------------------------
+-- FINANCIAL LEDGER PROTECTION
+-- ---------------------------------------------------------
+
+revoke insert, update, delete
+on public.wallet_transactions
+from authenticated;
+
+-- ---------------------------------------------------------
+-- AUDIT LOG PROTECTION
+-- ---------------------------------------------------------
+
+revoke insert, update, delete
+on public.audit_logs
+from authenticated;
+
+-- ---------------------------------------------------------
+-- INDEXES FOR SECURITY-CRITICAL LOOKUPS
+-- ---------------------------------------------------------
+
+create index if not exists idx_profiles_role
+on public.profiles(role);
+
+create index if not exists idx_profiles_account_status
+on public.profiles(account_status);
+
+create index if not exists idx_payments_status
+on public.payments(status);
+
+create index if not exists idx_investments_status
+on public.investments(status);
+
+-- =========================================================
+-- END BATCH 28
+-- =========================================================-- =========================================================
+-- BREETHUB BATCH 29
+-- COPYRIGHT + CONTENT MODERATION
+-- =========================================================
+
+create type public.content_report_reason as enum (
+  'copyright',
+  'plagiarism',
+  'harassment',
+  'spam',
+  'sexual_content',
+  'hate_or_abuse',
+  'violence',
+  'illegal_content',
+  'misleading',
+  'other'
+);
+
+create type public.content_report_status as enum (
+  'pending',
+  'under_review',
+  'resolved',
+  'dismissed',
+  'escalated'
+);
+
+-- ---------------------------------------------------------
+-- CONTENT REPORTS
+-- ---------------------------------------------------------
+
+create table if not exists public.content_reports (
+  id uuid primary key default gen_random_uuid(),
+
+  reporter_id uuid not null
+    references public.profiles(id)
+    on delete cascade,
+
+  story_id uuid
+    references public.stories(id)
+    on delete cascade,
+
+  chapter_id uuid
+    references public.chapters(id)
+    on delete cascade,
+
+  creator_id uuid
+    references public.profiles(id)
+    on delete set null,
+
+  reason public.content_report_reason not null,
+
+  title text,
+
+  description text not null,
+
+  evidence_url text,
+
+  status public.content_report_status
+    not null default 'pending',
+
+  assigned_to uuid
+    references public.profiles(id)
+    on delete set null,
+
+  reviewed_by uuid
+    references public.profiles(id)
+    on delete set null,
+
+  reviewer_notes text,
+
+  created_at timestamptz not null default now(),
+
+  reviewed_at timestamptz,
+
+  constraint content_report_has_target
+  check (
+    story_id is not null
+    or chapter_id is not null
+  )
+);
+
+-- ---------------------------------------------------------
+-- COPYRIGHT CLAIM DETAILS
+-- ---------------------------------------------------------
+
+create table if not exists public.copyright_claims (
+  id uuid primary key default gen_random_uuid(),
+
+  report_id uuid not null
+    references public.content_reports(id)
+    on delete cascade,
+
+  claimant_name text not null,
+
+  claimant_email text not null,
+
+  original_work_title text not null,
+
+  original_work_url text,
+
+  ownership_statement text not null,
+
+  electronic_signature text not null,
+
+  signature_date date not null,
+
+  declaration_confirmed boolean not null default false,
+
+  created_at timestamptz not null default now()
+);
+
+-- ---------------------------------------------------------
+-- MODERATION ACTIONS
+-- ---------------------------------------------------------
+
+create table if not exists public.content_moderation_actions (
+  id uuid primary key default gen_random_uuid(),
+
+  report_id uuid
+    references public.content_reports(id)
+    on delete set null,
+
+  story_id uuid
+    references public.stories(id)
+    on delete cascade,
+
+  chapter_id uuid
+    references public.chapters(id)
+    on delete cascade,
+
+  action text not null
+    check (
+      action in (
+        'warning',
+        'request_changes',
+        'hide_content',
+        'suspend_content',
+        'restore_content',
+        'remove_content',
+        'suspend_creator',
+        'restore_creator',
+        'dismiss_report'
+      )
+    ),
+
+  reason text,
+
+  performed_by uuid not null
+    references public.profiles(id)
+    on delete restrict,
+
+  created_at timestamptz not null default now()
+);
+
+-- ---------------------------------------------------------
+-- REPORT RLS
+-- ---------------------------------------------------------
+
+alter table public.content_reports enable row level security;
+
+drop policy if exists "Users create content reports"
+on public.content_reports;
+
+create policy "Users create content reports"
+on public.content_reports
+for insert
+to authenticated
+with check (
+  reporter_id = auth.uid()
+);
+
+drop policy if exists "Users view own content reports"
+on public.content_reports;
+
+create policy "Users view own content reports"
+on public.content_reports
+for select
+to authenticated
+using (
+  reporter_id = auth.uid()
+  or public.is_admin()
+);
+
+-- ---------------------------------------------------------
+-- COPYRIGHT CLAIM RLS
+-- ---------------------------------------------------------
+
+alter table public.copyright_claims enable row level security;
+
+drop policy if exists "Claimants view own copyright claims"
+on public.copyright_claims;
+
+create policy "Claimants view own copyright claims"
+on public.copyright_claims
+for select
+to authenticated
+using (
+  exists (
+    select 1
+    from public.content_reports cr
+    where cr.id = copyright_claims.report_id
+      and cr.reporter_id = auth.uid()
+  )
+  or public.is_admin()
+);
+
+drop policy if exists "Users create copyright claims"
+on public.copyright_claims;
+
+create policy "Users create copyright claims"
+on public.copyright_claims
+for insert
+to authenticated
+with check (
+  exists (
+    select 1
+    from public.content_reports cr
+    where cr.id = copyright_claims.report_id
+      and cr.reporter_id = auth.uid()
+  )
+);
+
+-- ---------------------------------------------------------
+-- MODERATION ACTION RLS
+-- ---------------------------------------------------------
+
+alter table public.content_moderation_actions enable row level security;
+
+drop policy if exists "Admin manage moderation actions"
+on public.content_moderation_actions;
+
+create policy "Admin manage moderation actions"
+on public.content_moderation_actions
+for all
+to authenticated
+using (
+  public.is_admin()
+)
+with check (
+  public.is_admin()
+);
+
+-- ---------------------------------------------------------
+-- INDEXES
+-- ---------------------------------------------------------
+
+create index if not exists idx_content_reports_status
+on public.content_reports(status);
+
+create index if not exists idx_content_reports_reporter
+on public.content_reports(reporter_id);
+
+create index if not exists idx_content_reports_story
+on public.content_reports(story_id);
+
+create index if not exists idx_content_reports_chapter
+on public.content_reports(chapter_id);
+
+create index if not exists idx_content_reports_creator
+on public.content_reports(creator_id);
+
+create index if not exists idx_copyright_claims_report
+on public.copyright_claims(report_id);
+
+-- =========================================================
+-- END BATCH 29
+-- =========================================================-- =========================================================
+-- BREETHUB BATCH 30
+-- PLATFORM FEATURE CONTROLS
+-- =========================================================
+
+create table if not exists public.platform_feature_flags (
+  id uuid primary key default gen_random_uuid(),
+
+  feature_key text not null unique,
+
+  feature_name text not null,
+
+  description text,
+
+  enabled boolean not null default true,
+
+  admin_only boolean not null default false,
+
+  created_at timestamptz not null default now(),
+
+  updated_at timestamptz not null default now()
+);
+
+-- ---------------------------------------------------------
+-- FEATURE LOOKUP
+-- ---------------------------------------------------------
+
+create or replace function public.feature_is_enabled(
+  p_feature_key text
+)
+returns boolean
+language sql
+stable
+security definer
+set search_path = public
+as $$
+  select coalesce(
+    (
+      select enabled
+      from public.platform_feature_flags
+      where feature_key = p_feature_key
+      limit 1
+    ),
+    false
+  );
+$$;
+
+-- ---------------------------------------------------------
+-- ADMIN FEATURE UPDATE
+-- ---------------------------------------------------------
+
+create or replace function public.admin_set_feature_flag(
+  p_feature_key text,
+  p_enabled boolean
+)
+returns boolean
+language plpgsql
+security definer
+set search_path = public
+as $$
+begin
+
+  if not public.is_admin() then
+    raise exception 'Admin access required';
+  end if;
+
+  update public.platform_feature_flags
+  set
+    enabled = p_enabled,
+    updated_at = now()
+  where feature_key = p_feature_key;
+
+  if not found then
+    raise exception 'Feature flag not found';
+  end if;
+
+  return true;
+end;
+$$;
+
+-- ---------------------------------------------------------
+-- FEATURE FLAG RLS
+-- ---------------------------------------------------------
+
+alter table public.platform_feature_flags enable row level security;
+
+drop policy if exists "Authenticated users read feature flags"
+on public.platform_feature_flags;
+
+create policy "Authenticated users read feature flags"
+on public.platform_feature_flags
+for select
+to authenticated
+using (
+  true
+);
+
+drop policy if exists "Admin manages feature flags"
+on public.platform_feature_flags;
+
+create policy "Admin manages feature flags"
+on public.platform_feature_flags
+for all
+to authenticated
+using (public.is_admin())
+with check (public.is_admin());
+
+-- ---------------------------------------------------------
+-- BREETHUB FEATURE CONFIGURATION
+--
+-- These are configuration switches, not fake users/data.
+-- Investment deliberately starts disabled pending legal review.
+-- ---------------------------------------------------------
+
+insert into public.platform_feature_flags (
+  feature_key,
+  feature_name,
+  description,
+  enabled,
+  admin_only
+)
+values
+(
+  'reader_chapter_purchases',
+  'Paid Chapter Reading',
+  'Allows readers to purchase eligible paid chapters.',
+  true,
+  false
+),
+(
+  'full_content_purchases',
+  'Full Content Purchases',
+  'Allows eligible books, scripts, articles, videos and audiobooks to be purchased.',
+  true,
+  false
+),
+(
+  'vertical_feed',
+  'Vertical Discovery Feed',
+  'Enables the swipe-based short content feed.',
+  true,
+  false
+),
+(
+  'writer_narration',
+  'Writer Narration',
+  'Allows approved writers to submit narration.',
+  true,
+  false
+),
+(
+  'music_library',
+  'Breethub Music Library',
+  'Allows creators to use authorized music tracks.',
+  true,
+  false
+),
+(
+  'free_spin',
+  'Free Spin Rewards',
+  'Allows qualifying readers to use Free Spin rewards.',
+  true,
+  false
+),
+(
+  'creator_gifts',
+  'Creator Gifts',
+  'Allows readers to send approved gifts to creators.',
+  true,
+  false
+),
+(
+  'affiliate_rewards',
+  'Affiliate Rewards',
+  'Enables affiliate reward programs.',
+  true,
+  false
+),
+(
+  'advertising',
+  'Advertising',
+  'Enables advertiser campaigns.',
+  true,
+  false
+),
+(
+  'story_investment',
+  'Story Investment',
+  'Investment functionality. Requires legal/regulatory approval before activation.',
+  false,
+  true
+),
+(
+  'writer_publishing',
+  'Writer Publishing',
+  'Allows approved writers to submit and publish content.',
+  true,
+  false
+),
+(
+  'chat',
+  'Breethub Chat',
+  'Enables user and official support conversations.',
+  true,
+  false
+)
+on conflict (feature_key)
+do nothing;
+
+-- ---------------------------------------------------------
+-- UPDATED_AT
+-- ---------------------------------------------------------
+
+drop trigger if exists trg_platform_feature_flags_updated_at
+on public.platform_feature_flags;
+
+create trigger trg_platform_feature_flags_updated_at
+before update on public.platform_feature_flags
+for each row
+execute function public.set_updated_at();
+
+-- ---------------------------------------------------------
+-- INDEX
+-- ---------------------------------------------------------
+
+create index if not exists idx_platform_feature_flags_enabled
+on public.platform_feature_flags(enabled);
+
+-- =========================================================
+-- END BATCH 30
+-- =========================================================
