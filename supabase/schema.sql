@@ -17943,3 +17943,2256 @@ on public.platform_feature_flags(enabled);
 -- =========================================================
 -- END BATCH 30
 -- =========================================================
+-- ============================================================
+-- BREETHUB BATCH 31
+-- USER ONBOARDING & ACCOUNT VERIFICATION
+-- ============================================================
+
+-- ------------------------------------------------------------
+-- ONBOARDING STATUS
+-- ------------------------------------------------------------
+
+create type public.onboarding_status as enum (
+  'not_started',
+  'in_progress',
+  'completed',
+  'blocked'
+);
+
+-- ------------------------------------------------------------
+-- USER ONBOARDING
+-- ------------------------------------------------------------
+
+create table if not exists public.user_onboarding (
+  user_id uuid primary key
+    references public.profiles(id)
+    on delete cascade,
+
+  status public.onboarding_status
+    not null default 'not_started',
+
+  profile_completed boolean
+    not null default false,
+
+  role_selected boolean
+    not null default false,
+
+  country_completed boolean
+    not null default false,
+
+  phone_completed boolean
+    not null default false,
+
+  terms_accepted boolean
+    not null default false,
+
+  completed_at timestamptz,
+
+  created_at timestamptz
+    not null default now(),
+
+  updated_at timestamptz
+    not null default now()
+);
+
+create index if not exists idx_user_onboarding_status
+on public.user_onboarding(status);
+
+-- ------------------------------------------------------------
+-- ACCOUNT VERIFICATION REQUESTS
+-- ------------------------------------------------------------
+
+create table if not exists public.account_verification_requests (
+  id uuid primary key default gen_random_uuid(),
+
+  user_id uuid not null
+    references public.profiles(id)
+    on delete cascade,
+
+  verification_type text not null
+    check (
+      verification_type in (
+        'email',
+        'phone',
+        'identity',
+        'creator',
+        'advertiser'
+      )
+    ),
+
+  status text not null default 'pending'
+    check (
+      status in (
+        'pending',
+        'approved',
+        'rejected',
+        'expired'
+      )
+    ),
+
+  document_url text,
+
+  submitted_at timestamptz
+    not null default now(),
+
+  reviewed_at timestamptz,
+
+  reviewed_by uuid
+    references public.profiles(id)
+    on delete set null,
+
+  rejection_reason text,
+
+  created_at timestamptz
+    not null default now()
+);
+
+create index if not exists idx_account_verification_user
+on public.account_verification_requests(user_id);
+
+create index if not exists idx_account_verification_status
+on public.account_verification_requests(status);
+
+-- ------------------------------------------------------------
+-- USER CONSENTS
+-- ------------------------------------------------------------
+
+create table if not exists public.user_consents (
+  id uuid primary key default gen_random_uuid(),
+
+  user_id uuid not null
+    references public.profiles(id)
+    on delete cascade,
+
+  consent_type text not null,
+
+  version text not null,
+
+  accepted boolean
+    not null default false,
+
+  accepted_at timestamptz,
+
+  created_at timestamptz
+    not null default now(),
+
+  unique(user_id, consent_type, version)
+);
+
+create index if not exists idx_user_consents_user
+on public.user_consents(user_id);
+
+-- ------------------------------------------------------------
+-- UPDATED_AT TRIGGER
+-- ------------------------------------------------------------
+
+drop trigger if exists trg_user_onboarding_updated_at
+on public.user_onboarding;
+
+create trigger trg_user_onboarding_updated_at
+before update on public.user_onboarding
+for each row
+execute function public.set_updated_at();
+
+-- ------------------------------------------------------------
+-- AUTOMATIC ONBOARDING RECORD
+-- ------------------------------------------------------------
+
+create or replace function public.create_user_onboarding()
+returns trigger
+language plpgsql
+security definer
+set search_path = public
+as $$
+begin
+
+  insert into public.user_onboarding (
+    user_id
+  )
+  values (
+    new.id
+  )
+  on conflict (user_id) do nothing;
+
+  return new;
+
+end;
+$$;
+
+drop trigger if exists trg_create_user_onboarding
+on public.profiles;
+
+create trigger trg_create_user_onboarding
+after insert on public.profiles
+for each row
+execute function public.create_user_onboarding();
+
+-- ------------------------------------------------------------
+-- ROW LEVEL SECURITY
+-- ------------------------------------------------------------
+
+alter table public.user_onboarding
+enable row level security;
+
+alter table public.account_verification_requests
+enable row level security;
+
+alter table public.user_consents
+enable row level security;
+
+-- ------------------------------------------------------------
+-- USER ONBOARDING POLICIES
+-- ------------------------------------------------------------
+
+drop policy if exists "Users read own onboarding"
+on public.user_onboarding;
+
+create policy "Users read own onboarding"
+on public.user_onboarding
+for select
+to authenticated
+using (
+  user_id = auth.uid()
+);
+
+drop policy if exists "Users update own onboarding"
+on public.user_onboarding;
+
+create policy "Users update own onboarding"
+on public.user_onboarding
+for update
+to authenticated
+using (
+  user_id = auth.uid()
+)
+with check (
+  user_id = auth.uid()
+);
+
+drop policy if exists "Admins manage onboarding"
+on public.user_onboarding;
+
+create policy "Admins manage onboarding"
+on public.user_onboarding
+for all
+to authenticated
+using (
+  public.is_admin()
+)
+with check (
+  public.is_admin()
+);
+
+-- ------------------------------------------------------------
+-- VERIFICATION REQUEST POLICIES
+-- ------------------------------------------------------------
+
+drop policy if exists "Users read own verification requests"
+on public.account_verification_requests;
+
+create policy "Users read own verification requests"
+on public.account_verification_requests
+for select
+to authenticated
+using (
+  user_id = auth.uid()
+);
+
+drop policy if exists "Users create own verification requests"
+on public.account_verification_requests;
+
+create policy "Users create own verification requests"
+on public.account_verification_requests
+for insert
+to authenticated
+with check (
+  user_id = auth.uid()
+);
+
+drop policy if exists "Admins manage verification requests"
+on public.account_verification_requests;
+
+create policy "Admins manage verification requests"
+on public.account_verification_requests
+for all
+to authenticated
+using (
+  public.is_admin()
+)
+with check (
+  public.is_admin()
+);
+
+-- ------------------------------------------------------------
+-- CONSENT POLICIES
+-- ------------------------------------------------------------
+
+drop policy if exists "Users read own consents"
+on public.user_consents;
+
+create policy "Users read own consents"
+on public.user_consents
+for select
+to authenticated
+using (
+  user_id = auth.uid()
+);
+
+drop policy if exists "Users create own consents"
+on public.user_consents;
+
+create policy "Users create own consents"
+on public.user_consents
+for insert
+to authenticated
+with check (
+  user_id = auth.uid()
+);
+
+drop policy if exists "Admins manage consents"
+on public.user_consents;
+
+create policy "Admins manage consents"
+on public.user_consents
+for all
+to authenticated
+using (
+  public.is_admin()
+)
+with check (
+  public.is_admin()
+);
+
+-- ============================================================
+-- END BATCH 31
+-- ============================================================-- ============================================================
+-- BREETHUB BATCH 32
+-- SECURE PAYMENT VERIFICATION & COURSE ACCESS GATE
+-- ============================================================
+
+-- ------------------------------------------------------------
+-- ADMIN / AUTHORIZED STAFF PAYMENT REVIEW FUNCTION
+--
+-- This is the trusted database action for approving or
+-- rejecting a payment.
+--
+-- Users cannot use this function unless they have the
+-- review_payments permission.
+-- ------------------------------------------------------------
+
+create or replace function public.review_payment(
+  p_payment_id uuid,
+  p_approved boolean,
+  p_reason text default null
+)
+returns boolean
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+  v_payment public.payments%rowtype;
+  v_new_status public.payment_status;
+  v_course public.courses%rowtype;
+begin
+
+  -- ----------------------------------------------------------
+  -- SECURITY CHECK
+  -- ----------------------------------------------------------
+
+  if not public.is_admin()
+     and not public.has_staff_permission(
+       'review_payments'::public.staff_permission
+     )
+  then
+    raise exception 'Payment review permission required';
+  end if;
+
+  -- ----------------------------------------------------------
+  -- LOAD PAYMENT
+  -- ----------------------------------------------------------
+
+  select *
+  into v_payment
+  from public.payments
+  where id = p_payment_id
+  for update;
+
+  if not found then
+    raise exception 'Payment not found';
+  end if;
+
+  -- ----------------------------------------------------------
+  -- PREVENT REVIEWING ALREADY FINALIZED PAYMENTS
+  -- ----------------------------------------------------------
+
+  if v_payment.status in (
+    'approved'::public.payment_status,
+    'rejected'::public.payment_status,
+    'refunded'::public.payment_status,
+    'cancelled'::public.payment_status
+  )
+  then
+    raise exception 'This payment has already reached a final status';
+  end if;
+
+  -- ----------------------------------------------------------
+  -- DETERMINE NEW STATUS
+  -- ----------------------------------------------------------
+
+  if p_approved then
+    v_new_status := 'approved'::public.payment_status;
+  else
+    v_new_status := 'rejected'::public.payment_status;
+  end if;
+
+  -- ----------------------------------------------------------
+  -- PAYMENT UPDATE
+  -- ----------------------------------------------------------
+
+  update public.payments
+  set
+    status = v_new_status,
+    verified_at = case
+      when p_approved then now()
+      else null
+    end,
+    verified_by = auth.uid(),
+    rejection_reason = case
+      when p_approved then null
+      else nullif(trim(p_reason), '')
+    end,
+    paid_at = case
+      when p_approved and paid_at is null then now()
+      else paid_at
+    end,
+    updated_at = now()
+  where id = p_payment_id;
+
+  -- ----------------------------------------------------------
+  -- PAYMENT REVIEW HISTORY
+  -- ----------------------------------------------------------
+
+  insert into public.payment_review_history (
+    payment_id,
+    reviewed_by,
+    old_status,
+    new_status,
+    reason
+  )
+  values (
+    v_payment.id,
+    auth.uid(),
+    v_payment.status,
+    v_new_status,
+    nullif(trim(p_reason), '')
+  );
+
+  -- ----------------------------------------------------------
+  -- UPDATE PAYMENT PROOFS
+  -- ----------------------------------------------------------
+
+  update public.payment_proofs
+  set
+    status = v_new_status,
+    reviewed_at = now(),
+    reviewed_by = auth.uid(),
+    rejection_reason = case
+      when p_approved then null
+      else nullif(trim(p_reason), '')
+    end
+  where payment_id = v_payment.id
+    and status not in (
+      'approved'::public.payment_status,
+      'rejected'::public.payment_status
+    );
+
+  -- ----------------------------------------------------------
+  -- COURSE PAYMENT
+  --
+  -- When approved:
+  -- 1. Create/activate course enrollment.
+  -- 2. Give the user course access.
+  -- 3. Update Writer/Affiliate onboarding when applicable.
+  -- ----------------------------------------------------------
+
+  if v_payment.payment_type =
+     'course'::public.payment_type
+     and v_payment.course_id is not null
+  then
+
+    select *
+    into v_course
+    from public.courses
+    where id = v_payment.course_id;
+
+    if p_approved then
+
+      insert into public.course_enrollments (
+        user_id,
+        course_id,
+        status,
+        access_status
+      )
+      values (
+        v_payment.user_id,
+        v_payment.course_id,
+        'active'::public.course_enrollment_status,
+        'approved'::public.course_access_status
+      )
+      on conflict (user_id, course_id)
+      do update
+      set
+        status = 'active'::public.course_enrollment_status,
+        access_status = 'approved'::public.course_access_status,
+        updated_at = now();
+
+      -- ------------------------------------------------------
+      -- WRITER ONBOARDING
+      -- ------------------------------------------------------
+
+      if exists (
+        select 1
+        from public.profiles
+        where id = v_payment.user_id
+          and role = 'writer'::public.app_role
+      )
+      then
+
+        update public.writer_onboarding
+        set
+          ghostwriting_access =
+            case
+              when v_course.course_type =
+                   'required_onboarding'::public.course_type
+              then
+                case
+                  when lower(v_course.title) like '%ghostwriting%'
+                  then 'approved'::public.course_access_status
+                  else ghostwriting_access
+                end
+              else ghostwriting_access
+            end,
+
+          ai_bootcamp_access =
+            case
+              when v_course.course_type =
+                   'ai_training'::public.course_type
+              then 'approved'::public.course_access_status
+              else ai_bootcamp_access
+            end,
+
+          updated_at = now()
+
+        where user_id = v_payment.user_id;
+
+      end if;
+
+      -- ------------------------------------------------------
+      -- AFFILIATE ONBOARDING
+      -- ------------------------------------------------------
+
+      if exists (
+        select 1
+        from public.profiles
+        where id = v_payment.user_id
+          and role = 'affiliate'::public.app_role
+      )
+      then
+
+        update public.affiliate_onboarding
+        set
+          affiliate_course_access =
+            case
+              when v_course.course_type =
+                   'required_onboarding'::public.course_type
+              then
+                case
+                  when lower(v_course.title) like '%affiliate%'
+                  then 'approved'::public.course_access_status
+                  else affiliate_course_access
+                end
+              else affiliate_course_access
+            end,
+
+          ai_bootcamp_access =
+            case
+              when v_course.course_type =
+                   'ai_training'::public.course_type
+              then 'approved'::public.course_access_status
+              else ai_bootcamp_access
+            end,
+
+          updated_at = now()
+
+        where user_id = v_payment.user_id;
+
+      end if;
+
+    else
+
+      -- ------------------------------------------------------
+      -- REJECT COURSE ACCESS
+      -- ------------------------------------------------------
+
+      update public.course_enrollments
+      set
+        status = 'cancelled'::public.course_enrollment_status,
+        access_status = 'rejected'::public.course_access_status,
+        updated_at = now()
+      where user_id = v_payment.user_id
+        and course_id = v_payment.course_id
+        and status <> 'completed'::public.course_enrollment_status;
+
+      -- Writer access remains locked when payment is rejected.
+
+      if exists (
+        select 1
+        from public.profiles
+        where id = v_payment.user_id
+          and role = 'writer'::public.app_role
+      )
+      then
+
+        update public.writer_onboarding
+        set
+          ghostwriting_access =
+            case
+              when v_course.course_type =
+                   'required_onboarding'::public.course_type
+               and lower(v_course.title) like '%ghostwriting%'
+              then 'rejected'::public.course_access_status
+              else ghostwriting_access
+            end,
+
+          ai_bootcamp_access =
+            case
+              when v_course.course_type =
+                   'ai_training'::public.course_type
+              then 'rejected'::public.course_access_status
+              else ai_bootcamp_access
+            end,
+
+          updated_at = now()
+
+        where user_id = v_payment.user_id;
+
+      end if;
+
+      -- Affiliate access remains locked when payment is rejected.
+
+      if exists (
+        select 1
+        from public.profiles
+        where id = v_payment.user_id
+          and role = 'affiliate'::public.app_role
+      )
+      then
+
+        update public.affiliate_onboarding
+        set
+          affiliate_course_access =
+            case
+              when v_course.course_type =
+                   'required_onboarding'::public.course_type
+               and lower(v_course.title) like '%affiliate%'
+              then 'rejected'::public.course_access_status
+              else affiliate_course_access
+            end,
+
+          ai_bootcamp_access =
+            case
+              when v_course.course_type =
+                   'ai_training'::public.course_type
+              then 'rejected'::public.course_access_status
+              else ai_bootcamp_access
+            end,
+
+          updated_at = now()
+
+        where user_id = v_payment.user_id;
+
+      end if;
+
+    end if;
+
+  end if;
+
+  return true;
+
+end;
+$$;
+
+-- ------------------------------------------------------------
+-- ONLY ADMIN / AUTHORIZED PAYMENT STAFF CAN EXECUTE
+-- ------------------------------------------------------------
+
+revoke all
+on function public.review_payment(
+  uuid,
+  boolean,
+  text
+)
+from public;
+
+grant execute
+on function public.review_payment(
+  uuid,
+  boolean,
+  text
+)
+to authenticated;
+
+-- ------------------------------------------------------------
+-- PAYMENT REVIEW LOOKUP INDEXES
+-- ------------------------------------------------------------
+
+create index if not exists idx_payments_course_status
+on public.payments(course_id, status);
+
+create index if not exists idx_payments_user_type_status
+on public.payments(user_id, payment_type, status);
+
+create index if not exists idx_payment_proofs_payment_status
+on public.payment_proofs(payment_id, status);
+
+create index if not exists idx_course_enrollments_user_access
+on public.course_enrollments(user_id, access_status);
+
+-- ------------------------------------------------------------
+-- END BATCH 32
+-- ============================================================-- ============================================================
+-- BREETHUB BATCH 33
+-- WRITER AI REVIEW + ADMIN PUBLICATION APPROVAL
+-- ============================================================
+
+-- ------------------------------------------------------------
+-- 1. WRITER SUBMISSION CREATION CHECK
+--
+-- A writer must have an unlocked Writer Dashboard before
+-- submitting content for publication.
+-- ------------------------------------------------------------
+
+create or replace function public.writer_can_submit_content(
+  p_writer_id uuid
+)
+returns boolean
+language sql
+stable
+security definer
+set search_path = public
+as $$
+  select exists (
+    select 1
+    from public.profiles p
+    join public.writer_onboarding wo
+      on wo.user_id = p.id
+    where p.id = p_writer_id
+      and p.role = 'writer'::public.app_role
+      and p.account_status = 'active'::public.account_status
+      and wo.dashboard_unlocked = true
+  );
+$$;
+
+
+-- ------------------------------------------------------------
+-- 2. AI REVIEW UPDATE FUNCTION
+--
+-- AI processing is controlled by the application/server.
+-- This function records the official AI review result.
+-- ------------------------------------------------------------
+
+create or replace function public.record_writer_ai_review(
+  p_submission_id uuid,
+  p_result public.ai_review_result,
+  p_overall_score numeric,
+  p_grammar_score numeric default null,
+  p_readability_score numeric default null,
+  p_originality_score numeric default null,
+  p_consistency_score numeric default null,
+  p_structure_score numeric default null,
+  p_title_score numeric default null,
+  p_description_score numeric default null,
+  p_cover_presentation_score numeric default null
+)
+returns boolean
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+  v_submission public.writer_publication_submissions%rowtype;
+begin
+
+  -- ----------------------------------------------------------
+  -- LOAD SUBMISSION
+  -- ----------------------------------------------------------
+
+  select *
+  into v_submission
+  from public.writer_publication_submissions
+  where id = p_submission_id
+  for update;
+
+  if not found then
+    raise exception 'Writer publication submission not found';
+  end if;
+
+
+  -- ----------------------------------------------------------
+  -- ONLY THE WRITER OR AUTHORIZED CONTENT STAFF CAN TRIGGER
+  -- THE REVIEW ACTION.
+  -- ----------------------------------------------------------
+
+  if auth.uid() <> v_submission.writer_id
+     and not public.is_admin()
+     and not public.has_staff_permission(
+       'manage_content'::public.staff_permission
+     )
+  then
+    raise exception 'Content review permission required';
+  end if;
+
+
+  -- ----------------------------------------------------------
+  -- AI SCORE VALIDATION
+  -- ----------------------------------------------------------
+
+  if p_overall_score is not null
+     and (p_overall_score < 0 or p_overall_score > 100)
+  then
+    raise exception 'Overall score must be between 0 and 100';
+  end if;
+
+
+  -- ----------------------------------------------------------
+  -- STORE AI REVIEW
+  -- ----------------------------------------------------------
+
+  insert into public.writer_ai_review_checks (
+    submission_id,
+    grammar_score,
+    readability_score,
+    originality_score,
+    consistency_score,
+    structure_score,
+    title_score,
+    description_score,
+    cover_presentation_score,
+    overall_score,
+    result
+  )
+  values (
+    p_submission_id,
+    p_grammar_score,
+    p_readability_score,
+    p_originality_score,
+    p_consistency_score,
+    p_structure_score,
+    p_title_score,
+    p_description_score,
+    p_cover_presentation_score,
+    p_overall_score,
+    p_result
+  );
+
+  -- ----------------------------------------------------------
+  -- UPDATE PUBLICATION SUBMISSION
+  -- ----------------------------------------------------------
+
+  update public.writer_publication_submissions
+  set
+    ai_result = p_result,
+    ai_reviewed_at = now(),
+    status =
+      case
+        when p_result = 'passed'::public.ai_review_result
+          then 'ready_for_admin_review'::public.writer_submission_status
+
+        when p_result = 'needs_revision'::public.ai_review_result
+          then 'changes_requested'::public.writer_submission_status
+
+        when p_result = 'failed'::public.ai_review_result
+          then 'changes_requested'::public.writer_submission_status
+
+        else status
+      end,
+    updated_at = now()
+  where id = p_submission_id;
+
+  return true;
+
+end;
+$$;
+
+
+-- ------------------------------------------------------------
+-- 3. ADMIN / CONTENT STAFF PUBLICATION DECISION
+--
+-- This is the trusted function that controls publication.
+--
+-- APPROVAL requires:
+--   - AI review passed
+--   - Writer submission exists
+--   - Reviewer has content-management permission
+--
+-- Writers cannot publish directly.
+-- ------------------------------------------------------------
+
+create or replace function public.review_writer_publication(
+  p_submission_id uuid,
+  p_decision text,
+  p_notes text default null,
+  p_rejection_reason text default null
+)
+returns boolean
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+  v_submission public.writer_publication_submissions%rowtype;
+  v_latest_ai public.writer_ai_review_checks%rowtype;
+begin
+
+  -- ----------------------------------------------------------
+  -- SECURITY CHECK
+  -- ----------------------------------------------------------
+
+  if not public.is_admin()
+     and not public.has_staff_permission(
+       'manage_content'::public.staff_permission
+     )
+  then
+    raise exception 'Content management permission required';
+  end if;
+
+
+  -- ----------------------------------------------------------
+  -- VALIDATE DECISION
+  -- ----------------------------------------------------------
+
+  if p_decision not in (
+    'approved',
+    'rejected',
+    'changes_requested'
+  )
+  then
+    raise exception 'Invalid publication decision';
+  end if;
+
+
+  -- ----------------------------------------------------------
+  -- LOAD SUBMISSION
+  -- ----------------------------------------------------------
+
+  select *
+  into v_submission
+  from public.writer_publication_submissions
+  where id = p_submission_id
+  for update;
+
+  if not found then
+    raise exception 'Writer publication submission not found';
+  end if;
+
+
+  -- ----------------------------------------------------------
+  -- LOAD LATEST AI REVIEW
+  -- ----------------------------------------------------------
+
+  select *
+  into v_latest_ai
+  from public.writer_ai_review_checks
+  where submission_id = p_submission_id
+  order by created_at desc
+  limit 1;
+
+
+  -- ----------------------------------------------------------
+  -- APPROVAL REQUIRES AI PASS
+  -- ----------------------------------------------------------
+
+  if p_decision = 'approved'
+     and (
+       not found
+       or v_latest_ai.result <>
+          'passed'::public.ai_review_result
+     )
+  then
+    raise exception 'Content cannot be approved until AI review has passed';
+  end if;
+
+
+  -- ----------------------------------------------------------
+  -- RECORD REVIEW DECISION
+  -- ----------------------------------------------------------
+
+  insert into public.content_review_decisions (
+    submission_id,
+    reviewer_id,
+    decision,
+    notes,
+    rejection_reason
+  )
+  values (
+    p_submission_id,
+    auth.uid(),
+    p_decision,
+    nullif(trim(p_notes), ''),
+    nullif(trim(p_rejection_reason), '')
+  );
+
+
+  -- ----------------------------------------------------------
+  -- APPROVED
+  -- ----------------------------------------------------------
+
+  if p_decision = 'approved' then
+
+    update public.writer_publication_submissions
+    set
+      status =
+        'approved'::public.writer_submission_status,
+      admin_reviewed_at = now(),
+      published_at = now(),
+      admin_notes = nullif(trim(p_notes), ''),
+      rejection_reason = null,
+      updated_at = now()
+    where id = p_submission_id;
+
+
+    -- --------------------------------------------------------
+    -- PUBLISH STORY
+    -- --------------------------------------------------------
+
+    if v_submission.story_id is not null then
+
+      update public.stories
+      set
+        status = 'published'::public.content_status,
+        published_at = coalesce(published_at, now()),
+        updated_at = now()
+      where id = v_submission.story_id;
+
+    end if;
+
+
+    -- --------------------------------------------------------
+    -- PUBLISH CHAPTER
+    -- --------------------------------------------------------
+
+    if v_submission.chapter_id is not null then
+
+      update public.chapters
+      set
+        status = 'published'::public.content_status,
+        published_at = coalesce(published_at, now()),
+        updated_at = now()
+      where id = v_submission.chapter_id;
+
+    end if;
+
+
+  -- ----------------------------------------------------------
+  -- CHANGES REQUESTED
+  -- ----------------------------------------------------------
+
+  elsif p_decision = 'changes_requested' then
+
+    update public.writer_publication_submissions
+    set
+      status =
+        'changes_requested'::public.writer_submission_status,
+      admin_reviewed_at = now(),
+      admin_notes = nullif(trim(p_notes), ''),
+      rejection_reason = null,
+      revision_notes = nullif(trim(p_notes), ''),
+      updated_at = now()
+    where id = p_submission_id;
+
+
+    if v_submission.story_id is not null then
+
+      update public.stories
+      set
+        status = 'pending_review'::public.content_status,
+        updated_at = now()
+      where id = v_submission.story_id;
+
+    end if;
+
+
+    if v_submission.chapter_id is not null then
+
+      update public.chapters
+      set
+        status = 'pending_review'::public.content_status,
+        updated_at = now()
+      where id = v_submission.chapter_id;
+
+    end if;
+
+
+  -- ----------------------------------------------------------
+  -- REJECTED
+  -- ----------------------------------------------------------
+
+  elsif p_decision = 'rejected' then
+
+    update public.writer_publication_submissions
+    set
+      status =
+        'rejected'::public.writer_submission_status,
+      admin_reviewed_at = now(),
+      admin_notes = nullif(trim(p_notes), ''),
+      rejection_reason =
+        nullif(trim(p_rejection_reason), ''),
+      updated_at = now()
+    where id = p_submission_id;
+
+
+    if v_submission.story_id is not null then
+
+      update public.stories
+      set
+        status = 'rejected'::public.content_status,
+        updated_at = now()
+      where id = v_submission.story_id;
+
+    end if;
+
+
+    if v_submission.chapter_id is not null then
+
+      update public.chapters
+      set
+        status = 'rejected'::public.content_status,
+        updated_at = now()
+      where id = v_submission.chapter_id;
+
+    end if;
+
+  end if;
+
+
+  return true;
+
+end;
+$$;
+
+
+-- ------------------------------------------------------------
+-- 4. FUNCTION PERMISSIONS
+--
+-- Functions are callable only by authenticated users.
+-- The functions themselves perform the permission checks.
+-- ------------------------------------------------------------
+
+revoke all
+on function public.writer_can_submit_content(uuid)
+from public;
+
+grant execute
+on function public.writer_can_submit_content(uuid)
+to authenticated;
+
+
+revoke all
+on function public.record_writer_ai_review(
+  uuid,
+  public.ai_review_result,
+  numeric,
+  numeric,
+  numeric,
+  numeric,
+  numeric,
+  numeric,
+  numeric,
+  numeric
+)
+from public;
+
+grant execute
+on function public.record_writer_ai_review(
+  uuid,
+  public.ai_review_result,
+  numeric,
+  numeric,
+  numeric,
+  numeric,
+  numeric,
+  numeric,
+  numeric
+)
+to authenticated;
+
+
+revoke all
+on function public.review_writer_publication(
+  uuid,
+  text,
+  text,
+  text
+)
+from public;
+
+grant execute
+on function public.review_writer_publication(
+  uuid,
+  text,
+  text,
+  text
+)
+to authenticated;
+
+
+-- ------------------------------------------------------------
+-- 5. SECURITY INDEXES
+-- ------------------------------------------------------------
+
+create index if not exists idx_writer_submission_ai_status
+on public.writer_publication_submissions(
+  ai_result,
+  status
+);
+
+create index if not exists idx_writer_ai_reviews_result
+on public.writer_ai_review_checks(
+  submission_id,
+  result,
+  created_at desc
+);
+
+create index if not exists idx_content_review_decisions_reviewer
+on public.content_review_decisions(
+  reviewer_id,
+  created_at desc
+);
+
+
+-- ============================================================
+-- END BATCH 33
+-- ============================================================-- =========================================================
+-- BREETHUB BATCH 34
+-- SCHEMA RECONCILIATION + SECURITY HARDENING
+-- =========================================================
+
+-- =========================================================
+-- 1. FIX PAYMENT SECURITY PERMISSION
+--
+-- Batch 28 referenced "view_financials", but that permission
+-- does not exist in the Breethub staff_permission enum.
+--
+-- Authorized payment reviewers use "review_payments".
+-- =========================================================
+
+create or replace function public.prevent_payment_self_approval()
+returns trigger
+language plpgsql
+security definer
+set search_path = public
+as $$
+begin
+
+  if auth.uid() is not null
+     and not public.is_admin()
+     and not public.has_staff_permission(
+       'review_payments'::public.staff_permission
+     )
+  then
+
+    if tg_op = 'UPDATE' then
+
+      new.status := old.status;
+      new.verified_at := old.verified_at;
+      new.verified_by := old.verified_by;
+      new.rejection_reason := old.rejection_reason;
+
+    end if;
+
+  end if;
+
+  return new;
+end;
+$$;
+
+
+-- Recreate trigger safely.
+
+drop trigger if exists trg_prevent_payment_self_approval
+on public.payments;
+
+create trigger trg_prevent_payment_self_approval
+before update on public.payments
+for each row
+execute function public.prevent_payment_self_approval();
+
+
+-- =========================================================
+-- 2. FIX CHAPTER PURCHASE SECURITY PERMISSION
+-- =========================================================
+
+create or replace function public.prevent_chapter_purchase_status_tampering()
+returns trigger
+language plpgsql
+security definer
+set search_path = public
+as $$
+begin
+
+  if auth.uid() is not null
+     and not public.is_admin()
+     and not public.has_staff_permission(
+       'review_payments'::public.staff_permission
+     )
+  then
+
+    new.status := old.status;
+
+    new.approved_at := old.approved_at;
+
+    new.approved_by := old.approved_by;
+
+    new.rejection_reason := old.rejection_reason;
+
+  end if;
+
+  return new;
+end;
+$$;
+
+
+drop trigger if exists trg_protect_chapter_purchase_status
+on public.chapter_purchases;
+
+create trigger trg_protect_chapter_purchase_status
+before update on public.chapter_purchases
+for each row
+execute function public.prevent_chapter_purchase_status_tampering();
+
+
+-- =========================================================
+-- 3. HARDEN INVESTMENT STATUS PROTECTION
+--
+-- Investment status must never be controlled by the
+-- investor themselves.
+--
+-- Admin or authorized investment-management staff may
+-- perform approved administrative changes.
+-- =========================================================
+
+create or replace function public.prevent_investment_client_status_changes()
+returns trigger
+language plpgsql
+security definer
+set search_path = public
+as $$
+begin
+
+  if auth.uid() is not null
+     and not public.is_admin()
+     and not public.has_staff_permission(
+       'manage_investments'::public.staff_permission
+     )
+  then
+
+    new.status := old.status;
+
+    new.approved_at := old.approved_at;
+
+    new.approved_by := old.approved_by;
+
+  end if;
+
+  return new;
+end;
+$$;
+
+
+drop trigger if exists trg_protect_investment_status
+on public.investments;
+
+create trigger trg_protect_investment_status
+before update on public.investments
+for each row
+execute function public.prevent_investment_client_status_changes();
+
+
+-- =========================================================
+-- 4. HARDEN ADVERTISER CAMPAIGN APPROVAL
+--
+-- Advertisers cannot approve their own campaigns.
+--
+-- Admin or authorized advertising-management staff may
+-- perform campaign approval/review actions.
+-- =========================================================
+
+create or replace function public.prevent_advertiser_campaign_self_approval()
+returns trigger
+language plpgsql
+security definer
+set search_path = public
+as $$
+begin
+
+  if auth.uid() is not null
+     and not public.is_admin()
+     and not public.has_staff_permission(
+       'manage_advertising'::public.staff_permission
+     )
+  then
+
+    new.status := old.status;
+
+    new.payment_verified_at := old.payment_verified_at;
+
+    new.payment_verified_by := old.payment_verified_by;
+
+    new.reviewed_at := old.reviewed_at;
+
+    new.reviewed_by := old.reviewed_by;
+
+    new.rejection_reason := old.rejection_reason;
+
+  end if;
+
+  return new;
+end;
+$$;
+
+
+drop trigger if exists trg_prevent_ad_campaign_self_approval
+on public.advertising_campaigns;
+
+create trigger trg_prevent_ad_campaign_self_approval
+before update on public.advertising_campaigns
+for each row
+execute function public.prevent_advertiser_campaign_self_approval();
+
+
+-- =========================================================
+-- 5. FIX WITHDRAWAL ELIGIBILITY FUNCTION
+--
+-- The previous version incorrectly selected wallet_type
+-- into an app_role variable.
+--
+-- wallet_type and app_role are different concepts.
+-- The wallet type is not needed for determining the user's
+-- withdrawal interval, so it is removed from this lookup.
+-- =========================================================
+
+create or replace function public.can_request_withdrawal(
+  p_user_id uuid,
+  p_wallet_id uuid
+)
+returns boolean
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+  v_available numeric;
+  v_role public.app_role;
+  v_minimum numeric;
+  v_interval integer;
+  v_last_withdrawal timestamptz;
+begin
+
+  -- Only the wallet owner or Admin can check/request
+  -- withdrawal eligibility for the account.
+  if auth.uid() <> p_user_id
+     and not public.is_admin() then
+    return false;
+  end if;
+
+
+  -- Get the wallet balance.
+  select available_balance
+  into v_available
+  from public.wallets
+  where id = p_wallet_id
+    and user_id = p_user_id
+    and is_active = true;
+
+  if v_available is null then
+    return false;
+  end if;
+
+
+  -- Get the actual application role.
+  select role
+  into v_role
+  from public.profiles
+  where id = p_user_id;
+
+
+  -- Get withdrawal rules for that role.
+  select
+    minimum_withdrawal,
+    withdrawal_interval_days
+  into
+    v_minimum,
+    v_interval
+  from public.withdrawal_settings
+  where role = v_role
+    and is_enabled = true;
+
+
+  -- Safe defaults if no role-specific rule exists.
+  if v_minimum is null then
+    v_minimum := 0;
+  end if;
+
+  if v_interval is null then
+    v_interval := 14;
+  end if;
+
+
+  -- Minimum withdrawal amount.
+  if v_available < v_minimum then
+    return false;
+  end if;
+
+
+  -- Enforce withdrawal interval.
+  select max(requested_at)
+  into v_last_withdrawal
+  from public.withdrawals
+  where user_id = p_user_id
+    and status not in (
+      'rejected',
+      'cancelled',
+      'failed'
+    );
+
+
+  if v_last_withdrawal is not null
+     and v_last_withdrawal >
+         now() - make_interval(days => v_interval) then
+    return false;
+  end if;
+
+
+  return true;
+
+end;
+$$;
+
+
+-- =========================================================
+-- 6. FIX COURSE ASSESSMENT PASS CHECK
+--
+-- The previous function referenced v_passed without
+-- declaring it.
+-- =========================================================
+
+create or replace function public.assessment_passed(
+  p_user_id uuid,
+  p_assessment_id uuid
+)
+returns boolean
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+  v_score numeric;
+  v_passed boolean;
+  v_pass_score numeric;
+begin
+
+  select
+    score,
+    passed
+  into
+    v_score,
+    v_passed
+  from public.assessment_attempts
+  where user_id = p_user_id
+    and assessment_id = p_assessment_id
+  order by submitted_at desc
+  limit 1;
+
+
+  select passing_score
+  into v_pass_score
+  from public.course_assessments
+  where id = p_assessment_id;
+
+
+  return coalesce(
+    v_passed,
+    false
+  )
+  and coalesce(
+    v_score,
+    0
+  ) >= coalesce(
+    v_pass_score,
+    80
+  );
+
+end;
+$$;
+
+
+-- =========================================================
+-- 7. PREVENT CLIENT-SIDE WITHDRAWAL APPROVAL CHANGES
+--
+-- Withdrawal approval/payment state belongs to Admin or
+-- authorized withdrawal-management staff.
+-- =========================================================
+
+create or replace function public.prevent_withdrawal_self_approval()
+returns trigger
+language plpgsql
+security definer
+set search_path = public
+as $$
+begin
+
+  if auth.uid() is not null
+     and not public.is_admin()
+     and not public.has_staff_permission(
+       'manage_withdrawals'::public.staff_permission
+     )
+  then
+
+    new.status := old.status;
+    new.reviewed_at := old.reviewed_at;
+    new.reviewed_by := old.reviewed_by;
+    new.paid_at := old.paid_at;
+    new.rejection_reason := old.rejection_reason;
+
+  end if;
+
+  return new;
+end;
+$$;
+
+
+drop trigger if exists trg_prevent_withdrawal_self_approval
+on public.withdrawals;
+
+create trigger trg_prevent_withdrawal_self_approval
+before update on public.withdrawals
+for each row
+execute function public.prevent_withdrawal_self_approval();
+
+
+-- =========================================================
+-- 8. PROTECT PLATFORM FEATURE FLAGS
+--
+-- Normal users may read feature availability but cannot
+-- directly change enabled/admin_only configuration.
+-- =========================================================
+
+revoke insert, update, delete
+on public.platform_feature_flags
+from authenticated;
+
+
+-- =========================================================
+-- 9. PROTECT CURRENCY CONFIGURATION
+--
+-- FX rates and currency rules are administrative data.
+-- Clients must not directly modify them.
+-- =========================================================
+
+revoke insert, update, delete
+on public.currency_settings
+from authenticated;
+
+revoke insert, update, delete
+on public.fx_rates
+from authenticated;
+
+
+-- =========================================================
+-- 10. PROTECT PRICING CONFIGURATION
+--
+-- Readers, writers, affiliates and advertisers must not
+-- directly modify Breethub pricing.
+-- Admin-controlled functions remain responsible for changes.
+-- =========================================================
+
+revoke insert, update, delete
+on public.platform_pricing
+from authenticated;
+
+revoke insert, update, delete
+on public.chapter_revenue_rules
+from authenticated;
+
+
+-- =========================================================
+-- 11. SECURITY-CRITICAL INDEXES
+-- =========================================================
+
+create index if not exists idx_withdrawals_user_status
+on public.withdrawals(user_id, status);
+
+create index if not exists idx_withdrawals_requested_at
+on public.withdrawals(requested_at);
+
+create index if not exists idx_assessment_attempts_user_assessment
+on public.assessment_attempts(user_id, assessment_id);
+
+create index if not exists idx_course_enrollments_user_status
+on public.course_enrollments(user_id, status);
+
+create index if not exists idx_payment_proofs_payment
+on public.payment_proofs(payment_id);
+
+
+-- =========================================================
+-- END BATCH 34
+-- =========================================================-- =========================================================
+-- BREETHUB BATCH 35
+-- SECURE WRITER AI REVIEW + PUBLISHING WORKFLOW
+-- =========================================================
+
+-- =========================================================
+-- 1. SECURE AI REVIEW RECORDING
+--
+-- Writers may submit content for AI review, but they must
+-- never be able to declare their own content as AI-approved.
+--
+-- Only Admin or authorized content-management staff may
+-- record the official AI review result.
+--
+-- A trusted backend/AI service can later use this function
+-- through a secure server-side integration.
+-- =========================================================
+
+create or replace function public.record_writer_ai_review(
+  p_submission_id uuid,
+  p_result public.ai_review_result,
+  p_overall_score numeric default null,
+  p_grammar_score numeric default null,
+  p_readability_score numeric default null,
+  p_consistency_score numeric default null,
+  p_cover_story_score numeric default null,
+  p_summary text default null,
+  p_suggestions text default null
+)
+returns boolean
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+  v_submission public.writer_publication_submissions%rowtype;
+begin
+
+  -- Only Admin or authorized content-management staff
+  -- may record an official AI review.
+  if not public.is_admin()
+     and not public.has_staff_permission(
+       'manage_content'::public.staff_permission
+     )
+  then
+    raise exception 'Authorized content review access required';
+  end if;
+
+
+  -- Get the submission.
+  select *
+  into v_submission
+  from public.writer_publication_submissions
+  where id = p_submission_id
+  for update;
+
+
+  if not found then
+    raise exception 'Writer publication submission not found';
+  end if;
+
+
+  -- The submission must belong to an active writer.
+  if not exists (
+    select 1
+    from public.profiles p
+    where p.id = v_submission.writer_id
+      and p.role = 'writer'::public.app_role
+      and p.account_status = 'active'::public.account_status
+  ) then
+    raise exception 'Submission writer is not active';
+  end if;
+
+
+  -- Scores must remain within a sensible range.
+  if p_overall_score is not null
+     and (p_overall_score < 0 or p_overall_score > 100) then
+    raise exception 'Overall score must be between 0 and 100';
+  end if;
+
+  if p_grammar_score is not null
+     and (p_grammar_score < 0 or p_grammar_score > 100) then
+    raise exception 'Grammar score must be between 0 and 100';
+  end if;
+
+  if p_readability_score is not null
+     and (p_readability_score < 0 or p_readability_score > 100) then
+    raise exception 'Readability score must be between 0 and 100';
+  end if;
+
+  if p_consistency_score is not null
+     and (p_consistency_score < 0 or p_consistency_score > 100) then
+    raise exception 'Consistency score must be between 0 and 100';
+  end if;
+
+  if p_cover_story_score is not null
+     and (p_cover_story_score < 0 or p_cover_story_score > 100) then
+    raise exception 'Cover/story score must be between 0 and 100';
+  end if;
+
+
+  -- Store the official AI review.
+  insert into public.writer_ai_review_checks (
+    submission_id,
+    overall_score,
+    grammar_score,
+    readability_score,
+    consistency_score,
+    cover_story_score,
+    result,
+    summary,
+    suggestions,
+    reviewed_by
+  )
+  values (
+    p_submission_id,
+    p_overall_score,
+    p_grammar_score,
+    p_readability_score,
+    p_consistency_score,
+    p_cover_story_score,
+    p_result,
+    p_summary,
+    p_suggestions,
+    auth.uid()
+  );
+
+
+  -- Keep the publication submission synchronized.
+  update public.writer_publication_submissions
+  set
+    ai_result = p_result,
+    ai_reviewed_at = now(),
+    updated_at = now()
+  where id = p_submission_id;
+
+
+  -- Move the submission to the appropriate state.
+  if p_result = 'passed' then
+
+    update public.writer_publication_submissions
+    set
+      status = 'ready_for_admin_review',
+      updated_at = now()
+    where id = p_submission_id;
+
+  elsif p_result in (
+    'needs_revision',
+    'failed'
+  ) then
+
+    update public.writer_publication_submissions
+    set
+      status = 'changes_requested',
+      updated_at = now()
+    where id = p_submission_id;
+
+  end if;
+
+
+  return true;
+
+end;
+$$;
+
+
+-- =========================================================
+-- 2. SECURE WRITER SUBMISSION CHECK
+--
+-- Writers may only submit their own content.
+-- Their dashboard must also be unlocked.
+-- =========================================================
+
+create or replace function public.writer_can_submit_content(
+  p_writer_id uuid
+)
+returns boolean
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+  v_role public.app_role;
+  v_status public.account_status;
+  v_dashboard_unlocked boolean;
+begin
+
+  -- Only the writer themselves or authorized Admin/staff
+  -- can check submission eligibility for that writer.
+  if auth.uid() <> p_writer_id
+     and not public.is_admin()
+     and not public.has_staff_permission(
+       'manage_content'::public.staff_permission
+     )
+  then
+    return false;
+  end if;
+
+
+  select
+    role,
+    account_status
+  into
+    v_role,
+    v_status
+  from public.profiles
+  where id = p_writer_id;
+
+
+  if v_role <> 'writer'::public.app_role then
+    return false;
+  end if;
+
+
+  if v_status <> 'active'::public.account_status then
+    return false;
+  end if;
+
+
+  select dashboard_unlocked
+  into v_dashboard_unlocked
+  from public.writer_onboarding
+  where user_id = p_writer_id;
+
+
+  return coalesce(v_dashboard_unlocked, false)
+     and public.feature_is_enabled('writer_publishing');
+
+end;
+$$;
+
+
+-- =========================================================
+-- 3. SECURE PUBLICATION APPROVAL
+--
+-- Admin/content staff can approve.
+--
+-- Requirements:
+--   1. Writer must be active.
+--   2. Writer dashboard must be unlocked.
+--   3. Writer publishing must be enabled.
+--   4. Latest AI review must exist.
+--   5. Latest AI review must be "passed".
+--   6. The submission must actually belong to the writer
+--      attached to the content.
+-- =========================================================
+
+create or replace function public.review_writer_publication(
+  p_submission_id uuid,
+  p_decision public.content_review_decision,
+  p_notes text default null
+)
+returns boolean
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+  v_submission public.writer_publication_submissions%rowtype;
+  v_latest_ai public.writer_ai_review_checks%rowtype;
+  v_writer_role public.app_role;
+  v_writer_status public.account_status;
+  v_dashboard_unlocked boolean;
+begin
+
+  -- Only Admin or content-management staff can approve.
+  if not public.is_admin()
+     and not public.has_staff_permission(
+       'manage_content'::public.staff_permission
+     )
+  then
+    raise exception 'Content review access required';
+  end if;
+
+
+  -- Publishing feature must be enabled.
+  if not public.feature_is_enabled('writer_publishing') then
+    raise exception 'Writer publishing is currently disabled';
+  end if;
+
+
+  -- Load submission.
+  select *
+  into v_submission
+  from public.writer_publication_submissions
+  where id = p_submission_id
+  for update;
+
+
+  if not found then
+    raise exception 'Publication submission not found';
+  end if;
+
+
+  -- Verify writer account.
+  select
+    role,
+    account_status
+  into
+    v_writer_role,
+    v_writer_status
+  from public.profiles
+  where id = v_submission.writer_id;
+
+
+  if v_writer_role <> 'writer'::public.app_role then
+    raise exception 'Submission owner is not a writer';
+  end if;
+
+
+  if v_writer_status <> 'active'::public.account_status then
+    raise exception 'Writer account is not active';
+  end if;
+
+
+  -- Verify dashboard unlock.
+  select dashboard_unlocked
+  into v_dashboard_unlocked
+  from public.writer_onboarding
+  where user_id = v_submission.writer_id;
+
+
+  if not coalesce(v_dashboard_unlocked, false) then
+    raise exception 'Writer dashboard is not unlocked';
+  end if;
+
+
+  -- Get the latest AI review.
+  select *
+  into v_latest_ai
+  from public.writer_ai_review_checks
+  where submission_id = p_submission_id
+  order by created_at desc
+  limit 1;
+
+
+  if not found then
+    raise exception 'AI review is required before publication review';
+  end if;
+
+
+  -- Approval requires a passed AI review.
+  if p_decision = 'approved'
+     and v_latest_ai.result <> 'passed'::public.ai_review_result then
+    raise exception 'Content cannot be approved until AI review passes';
+  end if;
+
+
+  -- Record the human/admin review decision.
+  insert into public.content_review_decisions (
+    submission_id,
+    decision,
+    notes,
+    reviewed_by,
+    reviewed_at
+  )
+  values (
+    p_submission_id,
+    p_decision,
+    p_notes,
+    auth.uid(),
+    now()
+  );
+
+
+  -- -------------------------------------------------------
+  -- APPROVED
+  -- -------------------------------------------------------
+
+  if p_decision = 'approved' then
+
+    update public.writer_publication_submissions
+    set
+      status = 'approved',
+      published_at = now(),
+      updated_at = now()
+    where id = p_submission_id;
+
+
+    -- Publish linked story.
+    if v_submission.story_id is not null then
+
+      update public.stories
+      set
+        status = 'published',
+        published_at = coalesce(published_at, now()),
+        updated_at = now()
+      where id = v_submission.story_id
+        and exists (
+          select 1
+          from public.stories s
+          where s.id = v_submission.story_id
+            and s.writer_id = v_submission.writer_id
+        );
+
+    end if;
+
+
+    -- Publish linked chapter.
+    if v_submission.chapter_id is not null then
+
+      update public.chapters
+      set
+        status = 'published',
+        published_at = coalesce(published_at, now()),
+        updated_at = now()
+      where id = v_submission.chapter_id
+        and exists (
+          select 1
+          from public.chapters c
+          where c.id = v_submission.chapter_id
+            and c.writer_id = v_submission.writer_id
+        );
+
+    end if;
+
+
+  -- -------------------------------------------------------
+  -- CHANGES REQUESTED
+  -- -------------------------------------------------------
+
+  elsif p_decision = 'changes_requested' then
+
+    update public.writer_publication_submissions
+    set
+      status = 'changes_requested',
+      updated_at = now()
+    where id = p_submission_id;
+
+
+    if v_submission.story_id is not null then
+
+      update public.stories
+      set
+        status = 'pending_review',
+        updated_at = now()
+      where id = v_submission.story_id
+        and writer_id = v_submission.writer_id;
+
+    end if;
+
+
+    if v_submission.chapter_id is not null then
+
+      update public.chapters
+      set
+        status = 'pending_review',
+        updated_at = now()
+      where id = v_submission.chapter_id
+        and writer_id = v_submission.writer_id;
+
+    end if;
+
+
+  -- -------------------------------------------------------
+  -- REJECTED
+  -- -------------------------------------------------------
+
+  elsif p_decision = 'rejected' then
+
+    update public.writer_publication_submissions
+    set
+      status = 'rejected',
+      updated_at = now()
+    where id = p_submission_id;
+
+
+    if v_submission.story_id is not null then
+
+      update public.stories
+      set
+        status = 'rejected',
+        updated_at = now()
+      where id = v_submission.story_id
+        and writer_id = v_submission.writer_id;
+
+    end if;
+
+
+    if v_submission.chapter_id is not null then
+
+      update public.chapters
+      set
+        status = 'rejected',
+        updated_at = now()
+      where id = v_submission.chapter_id
+        and writer_id = v_submission.writer_id;
+
+    end if;
+
+  end if;
+
+
+  return true;
+
+end;
+$$;
+
+
+-- =========================================================
+-- 4. PROTECT AI REVIEW TABLE FROM DIRECT CLIENT WRITES
+--
+-- The official AI review must go through the secure function.
+-- =========================================================
+
+revoke insert, update, delete
+on public.writer_ai_review_checks
+from authenticated;
+
+
+-- =========================================================
+-- 5. PROTECT PUBLICATION REVIEW DECISIONS
+--
+-- Review decisions must be created through the secure
+-- publication-review function.
+-- =========================================================
+
+revoke insert, update, delete
+on public.content_review_decisions
+from authenticated;
+
+
+-- =========================================================
+-- 6. SECURITY INDEXES
+-- =========================================================
+
+create index if not exists idx_writer_ai_review_submission_created
+on public.writer_ai_review_checks(
+  submission_id,
+  created_at desc
+);
+
+create index if not exists idx_writer_publication_writer_status
+on public.writer_publication_submissions(
+  writer_id,
+  status
+);
+
+create index if not exists idx_writer_publication_story
+on public.writer_publication_submissions(story_id);
+
+create index if not exists idx_writer_publication_chapter
+on public.writer_publication_submissions(chapter_id);
+
+
+-- =========================================================
+-- END BATCH 35
+-- =========================================================
