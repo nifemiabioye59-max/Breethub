@@ -20196,3 +20196,1309 @@ on public.writer_publication_submissions(chapter_id);
 -- =========================================================
 -- END BATCH 35
 -- =========================================================
+-- =========================================================
+-- BREETHUB BATCH 36
+-- ADMIN COURSE MANAGEMENT + COURSE COVERS
+-- =========================================================
+
+-- =========================================================
+-- 1. COURSE MANAGEMENT FIELDS
+--
+-- These fields allow Admin to manage how courses appear
+-- throughout Breethub.
+--
+-- The actual image/file is stored in Supabase Storage.
+-- cover_url stores the resulting public/signed URL.
+-- =========================================================
+
+alter table public.courses
+add column if not exists cover_url text;
+
+alter table public.courses
+add column if not exists category text;
+
+alter table public.courses
+add column if not exists affiliate_promotion_enabled boolean
+not null default false;
+
+alter table public.courses
+add column if not exists affiliate_commission_percent numeric(5,2)
+default 0;
+
+alter table public.courses
+add column if not exists updated_at timestamptz
+not null default now();
+
+
+-- =========================================================
+-- 2. VALIDATE AFFILIATE COMMISSION
+-- =========================================================
+
+alter table public.courses
+drop constraint if exists courses_affiliate_commission_valid;
+
+alter table public.courses
+add constraint courses_affiliate_commission_valid
+check (
+  affiliate_commission_percent >= 0
+  and affiliate_commission_percent <= 100
+);
+
+
+-- =========================================================
+-- 3. COURSE UPDATED_AT TRIGGER
+-- =========================================================
+
+drop trigger if exists courses_set_updated_at
+on public.courses;
+
+create trigger courses_set_updated_at
+before update on public.courses
+for each row
+execute function public.set_updated_at();
+
+
+-- =========================================================
+-- 4. ADMIN COURSE UPDATE FUNCTION
+--
+-- Admin controls:
+--   - title
+--   - description
+--   - cover
+--   - category
+--   - affiliate promotion
+--   - affiliate commission
+--
+-- Normal users cannot use this function.
+-- =========================================================
+
+create or replace function public.admin_update_course(
+  p_course_id uuid,
+  p_title text default null,
+  p_description text default null,
+  p_cover_url text default null,
+  p_category text default null,
+  p_affiliate_promotion_enabled boolean default null,
+  p_affiliate_commission_percent numeric default null
+)
+returns boolean
+language plpgsql
+security definer
+set search_path = public
+as $$
+begin
+
+  -- -------------------------------------------------------
+  -- ADMIN CHECK
+  -- -------------------------------------------------------
+
+  if not public.is_admin()
+     and not public.has_staff_permission(
+       'manage_courses'::public.staff_permission
+     )
+  then
+    raise exception 'Course management access required';
+  end if;
+
+
+  -- -------------------------------------------------------
+  -- COURSE EXISTENCE CHECK
+  -- -------------------------------------------------------
+
+  if not exists (
+    select 1
+    from public.courses
+    where id = p_course_id
+  ) then
+    raise exception 'Course not found';
+  end if;
+
+
+  -- -------------------------------------------------------
+  -- COMMISSION VALIDATION
+  -- -------------------------------------------------------
+
+  if p_affiliate_commission_percent is not null
+     and (
+       p_affiliate_commission_percent < 0
+       or p_affiliate_commission_percent > 100
+     )
+  then
+    raise exception
+      'Affiliate commission must be between 0 and 100 percent';
+  end if;
+
+
+  -- -------------------------------------------------------
+  -- UPDATE COURSE
+  --
+  -- null means keep the existing value.
+  -- -------------------------------------------------------
+
+  update public.courses
+  set
+    title = coalesce(p_title, title),
+
+    description = coalesce(
+      p_description,
+      description
+    ),
+
+    cover_url = coalesce(
+      p_cover_url,
+      cover_url
+    ),
+
+    category = coalesce(
+      p_category,
+      category
+    ),
+
+    affiliate_promotion_enabled = coalesce(
+      p_affiliate_promotion_enabled,
+      affiliate_promotion_enabled
+    ),
+
+    affiliate_commission_percent = coalesce(
+      p_affiliate_commission_percent,
+      affiliate_commission_percent
+    ),
+
+    updated_at = now()
+
+  where id = p_course_id;
+
+
+  return true;
+
+end;
+$$;
+
+
+-- =========================================================
+-- 5. ADMIN COURSE STATUS FUNCTION
+--
+-- Admin can activate, pause or draft a course.
+--
+-- This is intentionally separate from course metadata
+-- editing so that status changes are easy to audit later.
+-- =========================================================
+
+create or replace function public.admin_set_course_status(
+  p_course_id uuid,
+  p_status text
+)
+returns boolean
+language plpgsql
+security definer
+set search_path = public
+as $$
+begin
+
+  if not public.is_admin()
+     and not public.has_staff_permission(
+       'manage_courses'::public.staff_permission
+     )
+  then
+    raise exception 'Course management access required';
+  end if;
+
+
+  if p_status not in (
+    'draft',
+    'active',
+    'paused'
+  )
+  then
+    raise exception
+      'Invalid course status. Use draft, active or paused.';
+  end if;
+
+
+  if not exists (
+    select 1
+    from public.courses
+    where id = p_course_id
+  ) then
+    raise exception 'Course not found';
+  end if;
+
+
+  update public.courses
+  set
+    status = p_status,
+    updated_at = now()
+  where id = p_course_id;
+
+
+  return true;
+
+end;
+$$;
+
+
+-- =========================================================
+-- 6. ADMIN COURSE AFFILIATE SETTINGS
+--
+-- Affiliate promotion is completely controlled by Admin.
+--
+-- Affiliate users cannot switch this on themselves.
+-- =========================================================
+
+create or replace function public.admin_set_course_affiliate_settings(
+  p_course_id uuid,
+  p_enabled boolean,
+  p_commission_percent numeric
+)
+returns boolean
+language plpgsql
+security definer
+set search_path = public
+as $$
+begin
+
+  if not public.is_admin()
+     and not public.has_staff_permission(
+       'manage_courses'::public.staff_permission
+     )
+  then
+    raise exception 'Course management access required';
+  end if;
+
+
+  if p_commission_percent < 0
+     or p_commission_percent > 100
+  then
+    raise exception
+      'Affiliate commission must be between 0 and 100 percent';
+  end if;
+
+
+  if not exists (
+    select 1
+    from public.courses
+    where id = p_course_id
+  ) then
+    raise exception 'Course not found';
+  end if;
+
+
+  update public.courses
+  set
+    affiliate_promotion_enabled = p_enabled,
+    affiliate_commission_percent = p_commission_percent,
+    updated_at = now()
+  where id = p_course_id;
+
+
+  return true;
+
+end;
+$$;
+
+
+-- =========================================================
+-- 7. PROTECT COURSE CONFIGURATION
+--
+-- Clients cannot directly modify course configuration.
+--
+-- Admin/staff management functions remain the controlled
+-- way to make administrative changes.
+-- =========================================================
+
+revoke insert, update, delete
+on public.courses
+from authenticated;
+
+
+-- =========================================================
+-- 8. COURSE MANAGEMENT INDEXES
+-- =========================================================
+
+create index if not exists idx_courses_category
+on public.courses(category);
+
+create index if not exists idx_courses_affiliate_enabled
+on public.courses(affiliate_promotion_enabled);
+
+create index if not exists idx_courses_status
+on public.courses(status);
+
+
+-- =========================================================
+-- 9. COURSE COVER URL INDEX
+-- =========================================================
+
+create index if not exists idx_courses_cover_url
+on public.courses(cover_url);
+
+
+-- =========================================================
+-- 10. END BATCH 36
+-- =========================================================-- ============================================================
+-- BATCH 37
+-- COURSE LESSON MANAGEMENT + COURSE MEDIA CONTROL
+-- ============================================================
+
+-- ============================================================
+-- 1. COURSE LESSON MANAGEMENT
+-- ============================================================
+
+create table if not exists public.course_lessons (
+  id uuid primary key default gen_random_uuid(),
+
+  course_id uuid not null
+    references public.courses(id)
+    on delete cascade,
+
+  title text not null,
+  description text,
+
+  lesson_order integer not null default 1,
+
+  video_url text,
+  content_url text,
+
+  duration_minutes integer,
+
+  is_preview boolean not null default false,
+  is_published boolean not null default false,
+
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now(),
+
+  constraint course_lessons_order_check
+    check (lesson_order > 0),
+
+  constraint course_lessons_duration_check
+    check (
+      duration_minutes is null
+      or duration_minutes >= 0
+    )
+);
+
+create index if not exists course_lessons_course_idx
+  on public.course_lessons(course_id);
+
+create index if not exists course_lessons_order_idx
+  on public.course_lessons(course_id, lesson_order);
+
+create index if not exists course_lessons_published_idx
+  on public.course_lessons(is_published);
+
+
+-- ============================================================
+-- 2. UPDATED-AT TRIGGER
+-- ============================================================
+
+drop trigger if exists course_lessons_updated_at
+on public.course_lessons;
+
+create trigger course_lessons_updated_at
+before update on public.course_lessons
+for each row
+execute function public.set_updated_at();
+
+
+-- ============================================================
+-- 3. ADMIN CREATE / UPDATE COURSE LESSON
+-- ============================================================
+
+create or replace function public.admin_upsert_course_lesson(
+  p_lesson_id uuid default null,
+  p_course_id uuid default null,
+  p_title text default null,
+  p_description text default null,
+  p_lesson_order integer default 1,
+  p_video_url text default null,
+  p_content_url text default null,
+  p_duration_minutes integer default null,
+  p_is_preview boolean default false,
+  p_is_published boolean default false
+)
+returns uuid
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+  v_lesson_id uuid;
+begin
+
+  if not public.has_staff_permission('manage_courses') then
+    raise exception 'You do not have permission to manage courses';
+  end if;
+
+  if p_course_id is null then
+    raise exception 'Course ID is required';
+  end if;
+
+  if not exists (
+    select 1
+    from public.courses
+    where id = p_course_id
+  ) then
+    raise exception 'Course does not exist';
+  end if;
+
+  if p_title is null
+     or length(trim(p_title)) = 0 then
+    raise exception 'Lesson title is required';
+  end if;
+
+  if p_lesson_order < 1 then
+    raise exception 'Lesson order must be at least 1';
+  end if;
+
+  if p_duration_minutes is not null
+     and p_duration_minutes < 0 then
+    raise exception 'Duration cannot be negative';
+  end if;
+
+  if p_lesson_id is null then
+
+    insert into public.course_lessons (
+      course_id,
+      title,
+      description,
+      lesson_order,
+      video_url,
+      content_url,
+      duration_minutes,
+      is_preview,
+      is_published
+    )
+    values (
+      p_course_id,
+      trim(p_title),
+      p_description,
+      p_lesson_order,
+      p_video_url,
+      p_content_url,
+      p_duration_minutes,
+      coalesce(p_is_preview, false),
+      coalesce(p_is_published, false)
+    )
+    returning id into v_lesson_id;
+
+  else
+
+    update public.course_lessons
+    set
+      course_id = p_course_id,
+      title = trim(p_title),
+      description = p_description,
+      lesson_order = p_lesson_order,
+      video_url = p_video_url,
+      content_url = p_content_url,
+      duration_minutes = p_duration_minutes,
+      is_preview = coalesce(p_is_preview, false),
+      is_published = coalesce(p_is_published, false)
+    where id = p_lesson_id
+    returning id into v_lesson_id;
+
+    if v_lesson_id is null then
+      raise exception 'Course lesson not found';
+    end if;
+
+  end if;
+
+  return v_lesson_id;
+end;
+$$;
+
+
+-- ============================================================
+-- 4. ADMIN DELETE COURSE LESSON
+-- ============================================================
+
+create or replace function public.admin_delete_course_lesson(
+  p_lesson_id uuid
+)
+returns boolean
+language plpgsql
+security definer
+set search_path = public
+as $$
+begin
+
+  if not public.has_staff_permission('manage_courses') then
+    raise exception 'You do not have permission to manage courses';
+  end if;
+
+  delete from public.course_lessons
+  where id = p_lesson_id;
+
+  return found;
+end;
+$$;
+
+
+-- ============================================================
+-- 5. ADMIN PUBLISH / UNPUBLISH LESSON
+-- ============================================================
+
+create or replace function public.admin_set_course_lesson_status(
+  p_lesson_id uuid,
+  p_is_published boolean
+)
+returns boolean
+language plpgsql
+security definer
+set search_path = public
+as $$
+begin
+
+  if not public.has_staff_permission('manage_courses') then
+    raise exception 'You do not have permission to manage courses';
+  end if;
+
+  update public.course_lessons
+  set is_published = p_is_published
+  where id = p_lesson_id;
+
+  if not found then
+    raise exception 'Course lesson not found';
+  end if;
+
+  return true;
+end;
+$$;
+
+
+-- ============================================================
+-- 6. COURSE LESSON ORDERING
+-- ============================================================
+
+create or replace function public.admin_reorder_course_lesson(
+  p_lesson_id uuid,
+  p_new_order integer
+)
+returns boolean
+language plpgsql
+security definer
+set search_path = public
+as $$
+begin
+
+  if not public.has_staff_permission('manage_courses') then
+    raise exception 'You do not have permission to manage courses';
+  end if;
+
+  if p_new_order < 1 then
+    raise exception 'Lesson order must be at least 1';
+  end if;
+
+  update public.course_lessons
+  set lesson_order = p_new_order
+  where id = p_lesson_id;
+
+  if not found then
+    raise exception 'Course lesson not found';
+  end if;
+
+  return true;
+end;
+$$;
+
+
+-- ============================================================
+-- 7. COURSE LESSON RLS
+-- ============================================================
+
+alter table public.course_lessons enable row level security;
+
+drop policy if exists "course lessons public preview"
+on public.course_lessons;
+
+create policy "course lessons public preview"
+on public.course_lessons
+for select
+to anon, authenticated
+using (
+  is_published = true
+  and is_preview = true
+  and exists (
+    select 1
+    from public.courses c
+    where c.id = course_lessons.course_id
+      and c.status = 'active'
+  )
+);
+
+
+drop policy if exists "course lessons enrolled users"
+on public.course_lessons;
+
+create policy "course lessons enrolled users"
+on public.course_lessons
+for select
+to authenticated
+using (
+  exists (
+    select 1
+    from public.course_enrollments ce
+    where ce.course_id = course_lessons.course_id
+      and ce.user_id = auth.uid()
+  )
+);
+
+
+drop policy if exists "course lessons admin"
+on public.course_lessons;
+
+create policy "course lessons admin"
+on public.course_lessons
+for all
+to authenticated
+using (
+  public.has_staff_permission('manage_courses')
+)
+with check (
+  public.has_staff_permission('manage_courses')
+);
+
+
+-- ============================================================
+-- 8. REMOVE DIRECT CLIENT WRITES
+-- ============================================================
+
+revoke insert, update, delete
+on public.course_lessons
+from authenticated;
+
+
+-- ============================================================
+-- 9. COURSE MEDIA METADATA
+-- ============================================================
+
+create table if not exists public.course_lesson_media (
+  id uuid primary key default gen_random_uuid(),
+
+  lesson_id uuid not null
+    references public.course_lessons(id)
+    on delete cascade,
+
+  media_type text not null,
+
+  file_name text,
+  storage_path text not null,
+
+  mime_type text,
+  file_size_bytes bigint,
+
+  duration_seconds integer,
+
+  created_at timestamptz not null default now(),
+
+  constraint course_lesson_media_type_check
+    check (
+      media_type in (
+        'video',
+        'audio',
+        'document',
+        'image',
+        'attachment'
+      )
+    ),
+
+  constraint course_lesson_media_size_check
+    check (
+      file_size_bytes is null
+      or file_size_bytes >= 0
+    ),
+
+  constraint course_lesson_media_duration_check
+    check (
+      duration_seconds is null
+      or duration_seconds >= 0
+    )
+);
+
+create index if not exists course_lesson_media_lesson_idx
+  on public.course_lesson_media(lesson_id);
+
+create index if not exists course_lesson_media_type_idx
+  on public.course_lesson_media(media_type);
+
+
+-- ============================================================
+-- 10. ADMIN ADD COURSE LESSON MEDIA
+-- ============================================================
+
+create or replace function public.admin_add_course_lesson_media(
+  p_lesson_id uuid,
+  p_media_type text,
+  p_file_name text,
+  p_storage_path text,
+  p_mime_type text default null,
+  p_file_size_bytes bigint default null,
+  p_duration_seconds integer default null
+)
+returns uuid
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+  v_media_id uuid;
+begin
+
+  if not public.has_staff_permission('manage_courses') then
+    raise exception 'You do not have permission to manage courses';
+  end if;
+
+  if not exists (
+    select 1
+    from public.course_lessons
+    where id = p_lesson_id
+  ) then
+    raise exception 'Course lesson not found';
+  end if;
+
+  if p_media_type not in (
+    'video',
+    'audio',
+    'document',
+    'image',
+    'attachment'
+  ) then
+    raise exception 'Invalid course media type';
+  end if;
+
+  if p_storage_path is null
+     or length(trim(p_storage_path)) = 0 then
+    raise exception 'Storage path is required';
+  end if;
+
+  insert into public.course_lesson_media (
+    lesson_id,
+    media_type,
+    file_name,
+    storage_path,
+    mime_type,
+    file_size_bytes,
+    duration_seconds
+  )
+  values (
+    p_lesson_id,
+    p_media_type,
+    p_file_name,
+    p_storage_path,
+    p_mime_type,
+    p_file_size_bytes,
+    p_duration_seconds
+  )
+  returning id into v_media_id;
+
+  return v_media_id;
+end;
+$$;
+
+
+-- ============================================================
+-- 11. ADMIN REMOVE COURSE LESSON MEDIA
+-- ============================================================
+
+create or replace function public.admin_delete_course_lesson_media(
+  p_media_id uuid
+)
+returns boolean
+language plpgsql
+security definer
+set search_path = public
+as $$
+begin
+
+  if not public.has_staff_permission('manage_courses') then
+    raise exception 'You do not have permission to manage courses';
+  end if;
+
+  delete from public.course_lesson_media
+  where id = p_media_id;
+
+  return found;
+end;
+$$;
+
+
+-- ============================================================
+-- 12. MEDIA RLS
+-- ============================================================
+
+alter table public.course_lesson_media enable row level security;
+
+drop policy if exists "course lesson media enrolled users"
+on public.course_lesson_media;
+
+create policy "course lesson media enrolled users"
+on public.course_lesson_media
+for select
+to authenticated
+using (
+  exists (
+    select 1
+    from public.course_lessons cl
+    join public.course_enrollments ce
+      on ce.course_id = cl.course_id
+    where cl.id = course_lesson_media.lesson_id
+      and ce.user_id = auth.uid()
+  )
+);
+
+
+drop policy if exists "course lesson media admin"
+on public.course_lesson_media;
+
+create policy "course lesson media admin"
+on public.course_lesson_media
+for all
+to authenticated
+using (
+  public.has_staff_permission('manage_courses')
+)
+with check (
+  public.has_staff_permission('manage_courses')
+);
+
+
+revoke insert, update, delete
+on public.course_lesson_media
+from authenticated;
+
+
+-- ============================================================
+-- 13. COURSE LESSON COUNT
+-- ============================================================
+
+create or replace view public.course_lesson_counts
+with (security_invoker = true)
+as
+select
+  c.id as course_id,
+  count(cl.id)::integer as total_lessons,
+  count(cl.id) filter (
+    where cl.is_published = true
+  )::integer as published_lessons,
+  count(cl.id) filter (
+    where cl.is_preview = true
+  )::integer as preview_lessons
+from public.courses c
+left join public.course_lessons cl
+  on cl.course_id = c.id
+group by c.id;
+
+
+-- ============================================================
+-- 14. COURSE MANAGEMENT INDEXES
+-- ============================================================
+
+create index if not exists course_lessons_course_order_idx
+  on public.course_lessons(course_id, lesson_order);
+
+create index if not exists course_lesson_media_storage_idx
+  on public.course_lesson_media(storage_path);
+
+
+-- ============================================================
+-- 15. FUNCTION SECURITY
+-- ============================================================
+
+revoke all on function public.admin_upsert_course_lesson(
+  uuid,
+  uuid,
+  text,
+  text,
+  integer,
+  text,
+  text,
+  integer,
+  boolean,
+  boolean
+) from public;
+
+grant execute on function public.admin_upsert_course_lesson(
+  uuid,
+  uuid,
+  text,
+  text,
+  integer,
+  text,
+  text,
+  integer,
+  boolean,
+  boolean
+) to authenticated;
+
+
+revoke all on function public.admin_delete_course_lesson(uuid)
+from public;
+
+grant execute on function public.admin_delete_course_lesson(uuid)
+to authenticated;
+
+
+revoke all on function public.admin_set_course_lesson_status(uuid, boolean)
+from public;
+
+grant execute on function public.admin_set_course_lesson_status(uuid, boolean)
+to authenticated;
+
+
+revoke all on function public.admin_reorder_course_lesson(uuid, integer)
+from public;
+
+grant execute on function public.admin_reorder_course_lesson(uuid, integer)
+to authenticated;
+
+
+revoke all on function public.admin_add_course_lesson_media(
+  uuid,
+  text,
+  text,
+  text,
+  text,
+  bigint,
+  integer
+) from public;
+
+grant execute on function public.admin_add_course_lesson_media(
+  uuid,
+  text,
+  text,
+  text,
+  text,
+  bigint,
+  integer
+) to authenticated;
+
+
+revoke all on function public.admin_delete_course_lesson_media(uuid)
+from public;
+
+grant execute on function public.admin_delete_course_lesson_media(uuid)
+to authenticated;
+
+
+-- ============================================================
+-- END BATCH 37
+-- ============================================================-- ============================================================
+-- BATCH 38
+-- COURSE ACCESS AUDIT + SECURE ACCESS CHECKS
+-- ============================================================
+
+
+-- ============================================================
+-- 1. COURSE ACCESS AUDIT EVENTS
+-- ============================================================
+
+create table if not exists public.course_access_audit (
+  id uuid primary key default gen_random_uuid(),
+
+  user_id uuid not null
+    references public.profiles(id)
+    on delete cascade,
+
+  course_id uuid not null
+    references public.courses(id)
+    on delete cascade,
+
+  event_type text not null,
+
+  reason text,
+
+  related_payment_id uuid,
+
+  performed_by uuid
+    references public.profiles(id)
+    on delete set null,
+
+  created_at timestamptz not null default now(),
+
+  constraint course_access_audit_event_type_check
+    check (
+      event_type in (
+        'access_requested',
+        'payment_submitted',
+        'payment_approved',
+        'payment_rejected',
+        'access_granted',
+        'access_revoked',
+        'course_completed',
+        'assessment_passed',
+        'assessment_failed',
+        'dashboard_unlocked',
+        'access_denied'
+      )
+    )
+);
+
+
+create index if not exists course_access_audit_user_idx
+  on public.course_access_audit(user_id);
+
+create index if not exists course_access_audit_course_idx
+  on public.course_access_audit(course_id);
+
+create index if not exists course_access_audit_created_idx
+  on public.course_access_audit(created_at desc);
+
+create index if not exists course_access_audit_user_course_idx
+  on public.course_access_audit(user_id, course_id);
+
+
+-- ============================================================
+-- 2. ENABLE RLS
+-- ============================================================
+
+alter table public.course_access_audit enable row level security;
+
+
+-- ============================================================
+-- 3. USER CAN VIEW THEIR OWN COURSE ACCESS HISTORY
+-- ============================================================
+
+drop policy if exists "users view own course access audit"
+on public.course_access_audit;
+
+create policy "users view own course access audit"
+on public.course_access_audit
+for select
+to authenticated
+using (
+  user_id = auth.uid()
+);
+
+
+-- ============================================================
+-- 4. ADMIN / AUTHORIZED COURSE STAFF CAN VIEW AUDIT
+-- ============================================================
+
+drop policy if exists "course managers view access audit"
+on public.course_access_audit;
+
+create policy "course managers view access audit"
+on public.course_access_audit
+for select
+to authenticated
+using (
+  public.has_staff_permission('manage_courses')
+  or public.has_staff_permission('view_courses')
+);
+
+
+-- ============================================================
+-- 5. USERS CANNOT DIRECTLY INSERT AUDIT EVENTS
+-- ============================================================
+
+revoke insert, update, delete
+on public.course_access_audit
+from authenticated;
+
+
+-- ============================================================
+-- 6. SECURE AUDIT EVENT FUNCTION
+-- ============================================================
+
+create or replace function public.record_course_access_audit(
+  p_user_id uuid,
+  p_course_id uuid,
+  p_event_type text,
+  p_reason text default null,
+  p_related_payment_id uuid default null
+)
+returns uuid
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+  v_audit_id uuid;
+begin
+
+  if p_user_id is null then
+    raise exception 'User ID is required';
+  end if;
+
+  if p_course_id is null then
+    raise exception 'Course ID is required';
+  end if;
+
+  if p_event_type not in (
+    'access_requested',
+    'payment_submitted',
+    'payment_approved',
+    'payment_rejected',
+    'access_granted',
+    'access_revoked',
+    'course_completed',
+    'assessment_passed',
+    'assessment_failed',
+    'dashboard_unlocked',
+    'access_denied'
+  ) then
+    raise exception 'Invalid course access audit event';
+  end if;
+
+
+  /*
+    Only the user themselves or an authorized
+    Breethub staff member may create an audit event.
+  */
+
+  if auth.uid() <> p_user_id
+     and not public.has_staff_permission('manage_courses')
+     and not public.has_staff_permission('review_payments')
+  then
+    raise exception 'You are not authorized to record this event';
+  end if;
+
+
+  insert into public.course_access_audit (
+    user_id,
+    course_id,
+    event_type,
+    reason,
+    related_payment_id,
+    performed_by
+  )
+  values (
+    p_user_id,
+    p_course_id,
+    p_event_type,
+    p_reason,
+    p_related_payment_id,
+    auth.uid()
+  )
+  returning id into v_audit_id;
+
+
+  return v_audit_id;
+
+end;
+$$;
+
+
+-- ============================================================
+-- 7. SECURE COURSE ACCESS CHECK
+-- ============================================================
+
+create or replace function public.user_has_course_access(
+  p_user_id uuid,
+  p_course_id uuid
+)
+returns boolean
+language sql
+stable
+security definer
+set search_path = public
+as $$
+  select exists (
+    select 1
+    from public.course_enrollments ce
+    where ce.user_id = p_user_id
+      and ce.course_id = p_course_id
+  );
+$$;
+
+
+-- ============================================================
+-- 8. CURRENT USER COURSE ACCESS CHECK
+-- ============================================================
+
+create or replace function public.current_user_has_course_access(
+  p_course_id uuid
+)
+returns boolean
+language sql
+stable
+security definer
+set search_path = public
+as $$
+  select
+    auth.uid() is not null
+    and public.user_has_course_access(
+      auth.uid(),
+      p_course_id
+    );
+$$;
+
+
+-- ============================================================
+-- 9. ADMIN COURSE ACCESS HISTORY
+-- ============================================================
+
+create or replace view public.admin_course_access_history
+with (security_invoker = true)
+as
+select
+  ca.id,
+  ca.user_id,
+  p.full_name,
+  p.nickname,
+  p.email,
+  p.role,
+  ca.course_id,
+  c.title as course_title,
+  ca.event_type,
+  ca.reason,
+  ca.related_payment_id,
+  ca.performed_by,
+  ca.created_at
+from public.course_access_audit ca
+join public.profiles p
+  on p.id = ca.user_id
+join public.courses c
+  on c.id = ca.course_id;
+
+
+-- ============================================================
+-- 10. FUNCTION SECURITY
+-- ============================================================
+
+revoke all on function public.record_course_access_audit(
+  uuid,
+  uuid,
+  text,
+  text,
+  uuid
+)
+from public;
+
+grant execute on function public.record_course_access_audit(
+  uuid,
+  uuid,
+  text,
+  text,
+  uuid
+)
+to authenticated;
+
+
+revoke all on function public.user_has_course_access(
+  uuid,
+  uuid
+)
+from public;
+
+grant execute on function public.user_has_course_access(
+  uuid,
+  uuid
+)
+to authenticated;
+
+
+revoke all on function public.current_user_has_course_access(
+  uuid
+)
+from public;
+
+grant execute on function public.current_user_has_course_access(
+  uuid
+)
+to authenticated;
+
+
+-- ============================================================
+-- END BATCH 38
+-- ============================================================
